@@ -120,20 +120,40 @@ function authenticateClient(req, res, next) {
   next();
 }
 
-// Аутентификация для CONNECT запросов
+// ✅ ИСПРАВЛЕННАЯ аутентификация для CONNECT запросов
 function authenticateConnect(req) {
-  const auth = req.headers['proxy-authorization'];
-  if (!auth || !auth.startsWith('Basic ')) {
+  // Проверяем все возможные заголовки аутентификации
+  const auth = req.headers['proxy-authorization'] || 
+               req.headers['authorization'] ||
+               req.headers['Proxy-Authorization'] ||
+               req.headers['Authorization'];
+               
+  console.log(`🔍 CONNECT Auth attempt for: ${req.url}`);
+  console.log(`🔍 Available headers:`, Object.keys(req.headers).filter(h => h.toLowerCase().includes('auth')));
+  
+  if (!auth) {
+    console.log('❌ CONNECT: No auth header found');
     return null;
   }
 
-  const credentials = Buffer.from(auth.slice(6), 'base64').toString();
+  let credentials;
+  if (auth.startsWith('Basic ')) {
+    credentials = Buffer.from(auth.slice(6), 'base64').toString();
+  } else {
+    // Возможно auth уже декодирован или в другом формате
+    credentials = auth;
+  }
+
   const [username, password] = credentials.split(':');
+  console.log(`🔍 CONNECT: Trying user: ${username}`);
 
   if (!clientsConfig[username] || clientsConfig[username].password !== password) {
+    console.log(`❌ CONNECT: Invalid credentials for ${username}`);
+    console.log(`🔍 Available clients:`, Object.keys(clientsConfig));
     return null;
   }
 
+  console.log(`✅ CONNECT: Success for ${username}`);
   return username;
 }
 
@@ -356,11 +376,12 @@ const server = http.createServer(app);
 // Обработка CONNECT запросов для TCP/HTTPS прокси
 server.on('connect', (req, clientSocket, head) => {
   console.log(`🔌 CONNECT request: ${req.url}`);
+  console.log(`🔍 CONNECT headers:`, req.headers);
   
   const username = authenticateConnect(req);
   if (!username) {
     console.log('❌ CONNECT: Authentication failed');
-    clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\n\r\n');
+    clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Proxy"\r\n\r\n');
     clientSocket.end();
     return;
   }
@@ -391,6 +412,7 @@ server.on('connect', (req, clientSocket, head) => {
     const proxyAuth = Buffer.from(`${parsedProxy.username}:${parsedProxy.password}`).toString('base64');
     const connectRequest = `CONNECT ${req.url} HTTP/1.1\r\nProxy-Authorization: Basic ${proxyAuth}\r\n\r\n`;
     
+    console.log(`📤 Sending CONNECT to upstream: ${parsedProxy.host}:${parsedProxy.port}`);
     proxySocket.write(connectRequest);
   });
 
@@ -398,6 +420,8 @@ server.on('connect', (req, clientSocket, head) => {
   proxySocket.on('data', (data) => {
     if (!headersParsed) {
       const response = data.toString();
+      console.log(`📥 Upstream response: ${response.split('\r\n')[0]}`);
+      
       if (response.includes('200 Connection established') || response.includes('200 OK')) {
         console.log(`✅ TCP Tunnel established for ${username}`);
         clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
@@ -438,6 +462,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log('🔥 Hot reload: ENABLED');
   console.log('✅ HTTP Proxy: /proxy endpoint');
   console.log('✅ TCP Proxy: CONNECT method support');
+  console.log('✅ Enhanced CONNECT authentication');
   console.log('⚡ Concurrent mode: NO rotation locks');
   console.log('✅ Server started successfully');
   

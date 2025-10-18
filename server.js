@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 
 const app = express();
-const PORT = process.env.PORT || process.env.RAILWAY_PORT || 8080;
+const PORT = process.env.PORT || 8080;
 const PUBLIC_HOST = process.env.PUBLIC_HOST || `localhost:${PORT}`;
 const CONFIG_FILE = './clients-config.json';
 

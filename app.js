@@ -1,6 +1,7 @@
 const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const fs = require('fs');
+const http = require('http');
 const net = require('net');
 
 const app = express();
@@ -117,6 +118,23 @@ function authenticateClient(req, res, next) {
   req.clientIP = clientIP;
   console.log(`✅ Auth success: ${username} from ${clientIP}`);
   next();
+}
+
+// Аутентификация для CONNECT запросов
+function authenticateConnect(req) {
+  const auth = req.headers['proxy-authorization'];
+  if (!auth || !auth.startsWith('Basic ')) {
+    return null;
+  }
+
+  const credentials = Buffer.from(auth.slice(6), 'base64').toString();
+  const [username, password] = credentials.split(':');
+
+  if (!clientsConfig[username] || clientsConfig[username].password !== password) {
+    return null;
+  }
+
+  return username;
 }
 
 // Получение следующего прокси для клиента
@@ -236,7 +254,7 @@ app.post('/update-config', (req, res) => {
   }
 });
 
-// ✅ ИСПРАВЛЕННЫЙ прокси endpoint с правильной аутентификацией
+// ✅ ИСПРАВЛЕННЫЙ HTTP прокси endpoint
 app.use('/proxy', authenticateClient, (req, res, next) => {
   const username = req.clientUsername;
   const proxy = getNextProxy(username);
@@ -254,9 +272,9 @@ app.use('/proxy', authenticateClient, (req, res, next) => {
     });
   }
 
-  console.log(`🔄 Using proxy for ${username}: ${parsedProxy.host}:${parsedProxy.port}`);
+  console.log(`🔄 HTTP Proxy for ${username}: ${parsedProxy.host}:${parsedProxy.port}`);
 
-  // ✅ ПРАВИЛЬНЫЙ способ передачи аутентификации прокси
+  // Создаем прокси middleware для HTTP запросов
   const proxyMiddleware = createProxyMiddleware({
     target: `http://${parsedProxy.host}:${parsedProxy.port}`,
     changeOrigin: true,
@@ -264,15 +282,20 @@ app.use('/proxy', authenticateClient, (req, res, next) => {
       '^/proxy': ''
     },
     onError: (err, req, res) => {
-      console.error(`❌ Proxy error for ${username}:`, err.message);
-      res.status(502).json({ error: 'Proxy connection failed' });
+      console.error(`❌ HTTP Proxy error for ${username}:`, err.message);
+      if (!res.headersSent) {
+        res.status(502).json({ error: 'Proxy connection failed', details: err.message });
+      }
     },
     onProxyReq: (proxyReq, req, res) => {
-      // ✅ Добавляем Proxy-Authorization header для upstream прокси
+      // Добавляем аутентификацию для upstream прокси
       const proxyAuth = Buffer.from(`${parsedProxy.username}:${parsedProxy.password}`).toString('base64');
       proxyReq.setHeader('Proxy-Authorization', `Basic ${proxyAuth}`);
       
-      console.log(`➡️ Proxying ${req.method} ${req.url} for ${username} via ${parsedProxy.host}:${parsedProxy.port}`);
+      console.log(`➡️ HTTP Proxying ${req.method} ${req.url} for ${username} via ${parsedProxy.host}:${parsedProxy.port}`);
+    },
+    onProxyRes: (proxyRes, req, res) => {
+      console.log(`⬅️ HTTP Response ${proxyRes.statusCode} for ${req.clientUsername}`);
     }
   });
 
@@ -283,7 +306,6 @@ app.use('/proxy', authenticateClient, (req, res, next) => {
 app.post('/blacklist/add', (req, res) => {
   const { ip, admin_key } = req.body;
   
-  // Простая проверка админ ключа (в продакшене используйте более безопасный метод)
   if (admin_key !== process.env.ADMIN_KEY) {
     return res.status(403).json({ error: 'Admin access required' });
   }
@@ -328,14 +350,94 @@ app.get('/blacklist', (req, res) => {
   res.json({ blacklist: [...ipBlacklist] });
 });
 
+// ✅ ДОБАВЛЯЕМ TCP ПРОКСИ ФУНКЦИОНАЛЬНОСТЬ
+const server = http.createServer(app);
+
+// Обработка CONNECT запросов для TCP/HTTPS прокси
+server.on('connect', (req, clientSocket, head) => {
+  console.log(`🔌 CONNECT request: ${req.url}`);
+  
+  const username = authenticateConnect(req);
+  if (!username) {
+    console.log('❌ CONNECT: Authentication failed');
+    clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\n\r\n');
+    clientSocket.end();
+    return;
+  }
+
+  const proxy = getNextProxy(username);
+  if (!proxy) {
+    console.log(`❌ CONNECT: No proxy available for ${username}`);
+    clientSocket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
+    clientSocket.end();
+    return;
+  }
+
+  const parsedProxy = parseProxy(proxy);
+  if (!parsedProxy) {
+    console.log(`❌ CONNECT: Invalid proxy config for ${username}`);
+    clientSocket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
+    clientSocket.end();
+    return;
+  }
+
+  console.log(`🔄 TCP Proxy for ${username}: ${parsedProxy.host}:${parsedProxy.port} -> ${req.url}`);
+
+  // Подключаемся к upstream прокси
+  const proxySocket = net.createConnection(parsedProxy.port, parsedProxy.host);
+  
+  proxySocket.on('connect', () => {
+    // Отправляем CONNECT запрос к upstream прокси
+    const proxyAuth = Buffer.from(`${parsedProxy.username}:${parsedProxy.password}`).toString('base64');
+    const connectRequest = `CONNECT ${req.url} HTTP/1.1\r\nProxy-Authorization: Basic ${proxyAuth}\r\n\r\n`;
+    
+    proxySocket.write(connectRequest);
+  });
+
+  let headersParsed = false;
+  proxySocket.on('data', (data) => {
+    if (!headersParsed) {
+      const response = data.toString();
+      if (response.includes('200 Connection established') || response.includes('200 OK')) {
+        console.log(`✅ TCP Tunnel established for ${username}`);
+        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        headersParsed = true;
+        
+        // Начинаем туннелирование данных
+        clientSocket.pipe(proxySocket);
+        proxySocket.pipe(clientSocket);
+      } else {
+        console.log(`❌ TCP Proxy connection failed for ${username}: ${response.split('\r\n')[0]}`);
+        clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+        clientSocket.end();
+        proxySocket.end();
+      }
+    }
+  });
+
+  proxySocket.on('error', (err) => {
+    console.error(`❌ TCP Proxy error for ${username}:`, err.message);
+    if (!headersParsed) {
+      clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+    }
+    clientSocket.end();
+  });
+
+  clientSocket.on('error', (err) => {
+    console.error(`❌ Client socket error for ${username}:`, err.message);
+    proxySocket.end();
+  });
+});
+
 // Запуск сервера
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 FIXED Proxy server with correct auth running on port ${PORT}`);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 FULL Proxy server (HTTP + TCP) running on port ${PORT}`);
   console.log(`🌐 TCP Proxy: ${TCP_DOMAIN}:${TCP_PORT}`);
   console.log(`🌐 Public Domain: ${PUBLIC_DOMAIN}`);
   console.log('🤖 Managed by Telegram Bot');
   console.log('🔥 Hot reload: ENABLED');
-  console.log('✅ Proxy-Authorization header: FIXED');
+  console.log('✅ HTTP Proxy: /proxy endpoint');
+  console.log('✅ TCP Proxy: CONNECT method support');
   console.log('⚡ Concurrent mode: NO rotation locks');
   console.log('✅ Server started successfully');
   

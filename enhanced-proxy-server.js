@@ -330,7 +330,7 @@ function authenticate(authHeader) {
 }
 
 // ====== ОРИГИНАЛЬНЫЕ API ENDPOINTS ======
-const PUBLIC_HOST = (process.env.PUBLIC_HOST || 'shortline.proxy.rlwy.net:31822').toLowerCase();
+const PUBLIC_HOST = (process.env.PUBLIC_HOST || 'yamabiko.proxy.rlwy.net:38659').toLowerCase();
 const EXTRA_HOSTS = (process.env.EXTRA_HOSTS || '')
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 
@@ -724,7 +724,7 @@ server.on('connect', (req, clientSocket) => {
 });
 
 // ====== ЗАПУСК ======
-const PORT = process.env.PORT || process.env.RAILWAY_PORT || 35982;
+const PORT = process.env.PORT || process.env.RAILWAY_PORT || 8080;
 
 async function startServer() {
   await loadConfig();

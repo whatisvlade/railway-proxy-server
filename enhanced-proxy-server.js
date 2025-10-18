@@ -144,7 +144,31 @@ app.post('/api/add-client', async (req, res) => {
   });
 });
 
-// Удалить клиента
+// ✅ ИСПРАВЛЕНО: Удалить клиента (изменен путь с /api/remove-client на /api/delete-client)
+app.delete('/api/delete-client/:clientName', async (req, res) => {
+  const { clientName } = req.params;
+  
+  if (!clientsConfig[clientName]) {
+    return res.status(404).json({ error: 'Client not found' });
+  }
+  
+  // Закрываем все активные туннели клиента
+  const killed = closeUserTunnels(clientName);
+  
+  delete clientsConfig[clientName];
+  await saveConfig();
+  initializeClients();
+  
+  console.log(`🗑 Deleted client: ${clientName}, closed ${killed} tunnels`);
+  
+  res.json({
+    success: true,
+    message: `Client ${clientName} deleted successfully`,
+    closedTunnels: killed
+  });
+});
+
+// ✅ ДОБАВЛЕНО: Алиас для старого API (для совместимости)
 app.delete('/api/remove-client/:clientName', async (req, res) => {
   const { clientName } = req.params;
   
@@ -152,15 +176,18 @@ app.delete('/api/remove-client/:clientName', async (req, res) => {
     return res.status(404).json({ error: 'Client not found' });
   }
   
+  const killed = closeUserTunnels(clientName);
+  
   delete clientsConfig[clientName];
   await saveConfig();
   initializeClients();
   
-  console.log(`➖ Removed client: ${clientName}`);
+  console.log(`➖ Removed client: ${clientName}, closed ${killed} tunnels`);
   
   res.json({
     success: true,
-    message: `Client ${clientName} removed successfully`
+    message: `Client ${clientName} removed successfully`,
+    closedTunnels: killed
   });
 });
 
@@ -588,7 +615,8 @@ Auth: Basic (${authInfo})
     <ul>
       <li>GET /api/clients - list all clients</li>
       <li>POST /api/add-client - add new client</li>
-      <li>DELETE /api/remove-client/:name - remove client</li>
+      <li>DELETE /api/delete-client/:name - delete client</li>
+      <li>DELETE /api/remove-client/:name - remove client (alias)</li>
       <li>POST /api/add-proxy - add proxy to client</li>
       <li>DELETE /api/remove-proxy - remove proxy from client</li>
       <li>POST /api/rotate-client - rotate proxy for client</li>

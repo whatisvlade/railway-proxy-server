@@ -269,7 +269,7 @@ app.use('*', authenticate, proxyMiddleware);
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Proxy server with HOT CONFIG RELOAD running on port ${PORT}`);
   console.log(`🌐 Public (TCP Proxy): ${PUBLIC_HOST}`);
-  
+  console.log(`🌐 HTTP API: railway-proxy-server-production.up.railway.app`);
   // Получаем все возможные хостнейм для API
   const possibleHosts = [
     PUBLIC_HOST.split(':')[0],

@@ -2,9 +2,9 @@
   "name": "railway-proxy-server",
   "version": "1.0.0",
   "description": "Railway proxy server with hot config reload",
-  "main": "server.js",
+  "main": "app.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node app.js"
   },
   "dependencies": {
     "express": "^4.18.2",

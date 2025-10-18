@@ -1,4 +1,4 @@
-// enhanced-proxy-server.js — Railway Proxy + Telegram Bot Management
+// app.js — Railway Proxy + Telegram Bot Management
 const express = require('express');
 const http = require('http');
 const https = require('https');
@@ -13,21 +13,8 @@ app.use(express.json());
 // ====== КОНФИГУРАЦИЯ С ФАЙЛОВЫМ ХРАНЕНИЕМ ======
 const CONFIG_FILE = path.join(__dirname, 'clients-config.json');
 
-// Дефолтная конфигурация
-let clientsConfig = {
-  client1: {
-    password: 'pass123',
-    proxies: [
-      'http://FoCe58:mLESnP@194.28.211.207:9754'
-    ]
-  },
-  client2: {
-    password: 'pass123',
-    proxies: [
-      'http://AmBQRc:d8B6Y7@212.81.36.122:9321'
-    ]
-  }
-};
+// Пустая конфигурация - все клиенты добавляются через Telegram бота
+let clientsConfig = {};
 
 // ====== ФУНКЦИИ УПРАВЛЕНИЯ КОНФИГУРАЦИЕЙ ======
 async function loadConfig() {
@@ -36,7 +23,7 @@ async function loadConfig() {
     clientsConfig = JSON.parse(data);
     console.log('✅ Configuration loaded from file');
   } catch (error) {
-    console.log('📝 Using default configuration, creating config file...');
+    console.log('📝 Using empty configuration, creating config file...');
     await saveConfig();
   }
 }
@@ -343,7 +330,7 @@ function authenticate(authHeader) {
 }
 
 // ====== ОРИГИНАЛЬНЫЕ API ENDPOINTS ======
-const PUBLIC_HOST = (process.env.PUBLIC_HOST || 'nozomi.proxy.rlwy.net:58990').toLowerCase();
+const PUBLIC_HOST = (process.env.PUBLIC_HOST || 'ballast.proxy.rlwy.net:33271').toLowerCase();
 const EXTRA_HOSTS = (process.env.EXTRA_HOSTS || '')
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 
@@ -569,9 +556,11 @@ app.get('/', (req, res) => {
     }
   }
 
-  const authInfo = Object.keys(clientsConfig).map(clientName => 
-    `${clientName}/${clientsConfig[clientName].password}`
-  ).join(' или ');
+  const authInfo = Object.keys(clientsConfig).length > 0 
+    ? Object.keys(clientsConfig).map(clientName => 
+        `${clientName}/${clientsConfig[clientName].password}`
+      ).join(' или ')
+    : 'No clients configured - use Telegram bot to add clients';
 
   res.send(`
     <h1>🚀 Railway Proxy Rotator - Enhanced with Telegram Bot</h1>
@@ -761,9 +750,13 @@ async function startServer() {
     console.log(`✅ API self hostnames: ${[...SELF_HOSTNAMES].join(', ')}`);
     console.log(`🤖 Telegram Bot API enabled`);
     
-    Object.keys(clientsConfig).forEach(clientName => {
-      console.log(`📊 ${clientName}: ${clientProxies[clientName]?.length || 0} proxies`);
-    });
+    if (Object.keys(clientsConfig).length === 0) {
+      console.log(`📝 No clients configured - use Telegram bot to add clients`);
+    } else {
+      Object.keys(clientsConfig).forEach(clientName => {
+        console.log(`📊 ${clientName}: ${clientProxies[clientName]?.length || 0} proxies`);
+      });
+    }
     
     console.log(`⚡ Concurrent mode: NO rotation locks`);
     console.log(`🔍 Overlapping proxies: ${totalOverlapping}`);

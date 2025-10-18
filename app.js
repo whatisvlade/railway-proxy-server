@@ -2,13 +2,11 @@ const express = require('express');
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// Railway переменные
 const TCP_DOMAIN = process.env.RAILWAY_TCP_PROXY_DOMAIN;
 const TCP_PORT = process.env.RAILWAY_TCP_PROXY_PORT;
 const PUBLIC_DOMAIN = process.env.RAILWAY_PUBLIC_DOMAIN;
 
 app.use(express.json());
-
 let clientsConfig = {};
 
 app.get('/status', (req, res) => {

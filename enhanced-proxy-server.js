@@ -330,7 +330,7 @@ function authenticate(authHeader) {
 }
 
 // ====== ОРИГИНАЛЬНЫЕ API ENDPOINTS ======
-const PUBLIC_HOST = (process.env.PUBLIC_HOST || 'ballast.proxy.rlwy.net:33271').toLowerCase();
+const PUBLIC_HOST = (process.env.PUBLIC_HOST || 'nozomi.proxy.rlwy.net:58990').toLowerCase();
 const EXTRA_HOSTS = (process.env.EXTRA_HOSTS || '')
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 

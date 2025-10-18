@@ -236,7 +236,7 @@ app.post('/update-config', (req, res) => {
   }
 });
 
-// Прокси endpoint с аутентификацией
+// ✅ ИСПРАВЛЕННЫЙ прокси endpoint с правильной аутентификацией
 app.use('/proxy', authenticateClient, (req, res, next) => {
   const username = req.clientUsername;
   const proxy = getNextProxy(username);
@@ -256,20 +256,23 @@ app.use('/proxy', authenticateClient, (req, res, next) => {
 
   console.log(`🔄 Using proxy for ${username}: ${parsedProxy.host}:${parsedProxy.port}`);
 
-  // Создаем прокси middleware
+  // ✅ ПРАВИЛЬНЫЙ способ передачи аутентификации прокси
   const proxyMiddleware = createProxyMiddleware({
     target: `http://${parsedProxy.host}:${parsedProxy.port}`,
     changeOrigin: true,
     pathRewrite: {
       '^/proxy': ''
     },
-    auth: `${parsedProxy.username}:${parsedProxy.password}`,
     onError: (err, req, res) => {
       console.error(`❌ Proxy error for ${username}:`, err.message);
       res.status(502).json({ error: 'Proxy connection failed' });
     },
     onProxyReq: (proxyReq, req, res) => {
-      console.log(`➡️ Proxying ${req.method} ${req.url} for ${username}`);
+      // ✅ Добавляем Proxy-Authorization header для upstream прокси
+      const proxyAuth = Buffer.from(`${parsedProxy.username}:${parsedProxy.password}`).toString('base64');
+      proxyReq.setHeader('Proxy-Authorization', `Basic ${proxyAuth}`);
+      
+      console.log(`➡️ Proxying ${req.method} ${req.url} for ${username} via ${parsedProxy.host}:${parsedProxy.port}`);
     }
   });
 
@@ -327,11 +330,12 @@ app.get('/blacklist', (req, res) => {
 
 // Запуск сервера
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Proxy server with HOT CONFIG RELOAD running on port ${PORT}`);
+  console.log(`🚀 FIXED Proxy server with correct auth running on port ${PORT}`);
   console.log(`🌐 TCP Proxy: ${TCP_DOMAIN}:${TCP_PORT}`);
   console.log(`🌐 Public Domain: ${PUBLIC_DOMAIN}`);
   console.log('🤖 Managed by Telegram Bot');
   console.log('🔥 Hot reload: ENABLED');
+  console.log('✅ Proxy-Authorization header: FIXED');
   console.log('⚡ Concurrent mode: NO rotation locks');
   console.log('✅ Server started successfully');
   

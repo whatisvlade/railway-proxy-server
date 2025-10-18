@@ -1,717 +1,715 @@
+// enhanced-proxy-server.js — Railway Proxy + Telegram Bot Management
 const express = require('express');
-const { createProxyMiddleware } = require('http-proxy-middleware');
-const fs = require('fs');
 const http = require('http');
+const https = require('https');
 const net = require('net');
+const { URL } = require('url');
+const fs = require('fs').promises;
+const path = require('path');
 
 const app = express();
-const PORT = process.env.PORT || 8080;
-
-// Railway переменные
-const TCP_DOMAIN = process.env.RAILWAY_TCP_PROXY_DOMAIN;
-const TCP_PORT = process.env.RAILWAY_TCP_PROXY_PORT;
-const PUBLIC_DOMAIN = process.env.RAILWAY_PUBLIC_DOMAIN;
-
-const CONFIG_FILE = './clients-config.json';
-const BLACKLIST_FILE = './ip-blacklist.json';
-
-// Middleware
 app.use(express.json());
 
-// Конфигурации
-let clientsConfig = {};
-let ipBlacklist = new Set();
-let proxyRotation = {};
+// ====== КОНФИГУРАЦИЯ С ФАЙЛОВЫМ ХРАНЕНИЕМ ======
+const CONFIG_FILE = path.join(__dirname, 'clients-config.json');
 
-// 🔄 Глобальные агенты для keep-alive соединений
-let globalProxyAgents = {};
+// Дефолтная конфигурация
+let clientsConfig = {
+  client1: {
+    password: 'pass123',
+    proxies: [
+      'http://FoCe58:mLESnP@194.28.211.207:9754'
+    ]
+  },
+  client2: {
+    password: 'pass123',
+    proxies: [
+      'http://AmBQRc:d8B6Y7@212.81.36.122:9321'
+    ]
+  }
+};
 
-// Загрузка конфигурации
-function loadConfig() {
+// ====== ФУНКЦИИ УПРАВЛЕНИЯ КОНФИГУРАЦИЕЙ ======
+async function loadConfig() {
   try {
-    if (fs.existsSync(CONFIG_FILE)) {
-      const data = fs.readFileSync(CONFIG_FILE, 'utf8');
-      clientsConfig = JSON.parse(data);
-      console.log(`✅ Configuration loaded: ${Object.keys(clientsConfig).length} clients`);
+    const data = await fs.readFile(CONFIG_FILE, 'utf8');
+    clientsConfig = JSON.parse(data);
+    console.log('✅ Configuration loaded from file');
+  } catch (error) {
+    console.log('📝 Using default configuration, creating config file...');
+    await saveConfig();
+  }
+}
+
+async function saveConfig() {
+  try {
+    await fs.writeFile(CONFIG_FILE, JSON.stringify(clientsConfig, null, 2));
+    console.log('💾 Configuration saved to file');
+  } catch (error) {
+    console.error('❌ Failed to save configuration:', error.message);
+  }
+}
+
+// ====== ДИНАМИЧЕСКИЕ СТРУКТУРЫ ======
+let users = {};
+let clientProxies = {};
+let allProxySets = {};
+let currentProxies = {};
+let rotationCounters = {};
+const lastRotationTime = new Map();
+const activeTunnels = {};
+const blockedProxies = new Set();
+
+// ====== ИНИЦИАЛИЗАЦИЯ КЛИЕНТОВ ======
+function initializeClients() {
+  // Очищаем старые данные
+  users = {};
+  clientProxies = {};
+  allProxySets = {};
+  currentProxies = {};
+  rotationCounters = {};
+  
+  // Инициализируем из конфигурации
+  Object.keys(clientsConfig).forEach(clientName => {
+    const config = clientsConfig[clientName];
+    users[clientName] = config.password;
+    clientProxies[clientName] = [...config.proxies];
+    allProxySets[clientName] = new Set(config.proxies);
+    currentProxies[clientName] = [...config.proxies];
+    rotationCounters[clientName] = rotationCounters[clientName] || 0;
+    activeTunnels[clientName] = activeTunnels[clientName] || new Set();
+
+    console.log(`✅ Initialized client: ${clientName} with ${config.proxies.length} proxies`);
+  });
+
+  // Проверяем пересечения
+  checkProxyOverlaps();
+}
+
+function checkProxyOverlaps() {
+  const clientNames = Object.keys(clientsConfig);
+  for (let i = 0; i < clientNames.length; i++) {
+    for (let j = i + 1; j < clientNames.length; j++) {
+      const client1Name = clientNames[i];
+      const client2Name = clientNames[j];
+      const client1Set = allProxySets[client1Name];
+      const client2Set = allProxySets[client2Name];
+      const intersection = clientProxies[client1Name].filter(p => client2Set.has(p));
       
-      // Инициализация ротации для каждого клиента
-      Object.keys(clientsConfig).forEach(username => {
-        if (clientsConfig[username].proxies && clientsConfig[username].proxies.length > 0) {
-          proxyRotation[username] = { currentIndex: 0 };
-        }
-      });
-    } else {
-      console.log('📝 No config file found, using empty configuration');
-      clientsConfig = {};
-    }
-  } catch (error) {
-    console.error('❌ Error loading config:', error);
-    clientsConfig = {};
-  }
-}
-
-// Загрузка блэклиста
-function loadBlacklist() {
-  try {
-    if (fs.existsSync(BLACKLIST_FILE)) {
-      const data = fs.readFileSync(BLACKLIST_FILE, 'utf8');
-      const blacklistArray = JSON.parse(data);
-      ipBlacklist = new Set(blacklistArray);
-      console.log(`🚫 Blacklist loaded: ${ipBlacklist.size} IPs`);
-    }
-  } catch (error) {
-    console.error('❌ Error loading blacklist:', error);
-    ipBlacklist = new Set();
-  }
-}
-
-// Сохранение конфигурации
-function saveConfig() {
-  try {
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(clientsConfig, null, 2));
-    console.log('💾 Configuration saved');
-  } catch (error) {
-    console.error('❌ Error saving config:', error);
-  }
-}
-
-// Сохранение блэклиста
-function saveBlacklist() {
-  try {
-    fs.writeFileSync(BLACKLIST_FILE, JSON.stringify([...ipBlacklist], null, 2));
-    console.log('💾 Blacklist saved');
-  } catch (error) {
-    console.error('❌ Error saving blacklist:', error);
-  }
-}
-
-// 🔄 Очистка keep-alive соединений для клиента
-function clearKeepAliveConnections(username) {
-  if (globalProxyAgents[username]) {
-    try {
-      globalProxyAgents[username].destroy();
-      delete globalProxyAgents[username];
-      console.log(`🧹 Cleared keep-alive connections for ${username}`);
-    } catch (error) {
-      console.error(`❌ Error clearing connections for ${username}:`, error);
+      if (intersection.length > 0) {
+        console.warn(`⚠️ WARNING: Overlapping proxies between ${client1Name} and ${client2Name}: ${intersection.map(p => p.split('@')[1]).join(', ')}`);
+      }
     }
   }
 }
 
-// Получение клиентского IP
-function getClientIP(req) {
-  return req.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
-         req.headers['x-real-ip'] ||
-         req.connection.remoteAddress ||
-         req.socket.remoteAddress ||
-         req.ip;
-}
+// ====== API ДЛЯ TELEGRAM БОТА ======
 
-// Аутентификация клиента
-function authenticateClient(req, res, next) {
-  const clientIP = getClientIP(req);
-  
-  // Проверка блэклиста
-  if (ipBlacklist.has(clientIP)) {
-    console.log(`🚫 Blocked IP: ${clientIP}`);
-    return res.status(403).json({ error: 'Access denied' });
-  }
-
-  const auth = req.headers.authorization;
-  if (!auth || !auth.startsWith('Basic ')) {
-    return res.status(401).json({ error: 'Authentication required' });
-  }
-
-  const credentials = Buffer.from(auth.slice(6), 'base64').toString();
-  const [username, password] = credentials.split(':');
-
-  if (!clientsConfig[username] || clientsConfig[username].password !== password) {
-    console.log(`❌ Auth failed: ${username} from ${clientIP}`);
-    return res.status(401).json({ error: 'Invalid credentials' });
-  }
-
-  req.clientUsername = username;
-  req.clientIP = clientIP;
-  console.log(`✅ Auth success: ${username} from ${clientIP}`);
-  next();
-}
-
-// ✅ ИСПРАВЛЕННАЯ аутентификация для CONNECT запросов
-function authenticateConnect(req) {
-  // Проверяем все возможные заголовки аутентификации
-  const auth = req.headers['proxy-authorization'] || 
-               req.headers['authorization'] ||
-               req.headers['Proxy-Authorization'] ||
-               req.headers['Authorization'];
-               
-  console.log(`🔍 CONNECT Auth attempt for: ${req.url}`);
-  console.log(`🔍 Available headers:`, Object.keys(req.headers).filter(h => h.toLowerCase().includes('auth')));
-  
-  if (!auth) {
-    console.log('❌ CONNECT: No auth header found');
-    return null;
-  }
-
-  let credentials;
-  if (auth.startsWith('Basic ')) {
-    credentials = Buffer.from(auth.slice(6), 'base64').toString();
-  } else {
-    // Возможно auth уже декодирован или в другом формате
-    credentials = auth;
-  }
-
-  const [username, password] = credentials.split(':');
-  console.log(`🔍 CONNECT: Trying user: ${username}`);
-
-  if (!clientsConfig[username] || clientsConfig[username].password !== password) {
-    console.log(`❌ CONNECT: Invalid credentials for ${username}`);
-    console.log(`🔍 Available clients:`, Object.keys(clientsConfig));
-    return null;
-  }
-
-  console.log(`✅ CONNECT: Success for ${username}`);
-  return username;
-}
-
-// Получение следующего прокси для клиента (автоматическая ротация)
-function getNextProxy(username) {
-  const client = clientsConfig[username];
-  if (!client || !client.proxies || client.proxies.length === 0) {
-    return null;
-  }
-
-  if (!proxyRotation[username]) {
-    proxyRotation[username] = { currentIndex: 0 };
-  }
-
-  const proxy = client.proxies[proxyRotation[username].currentIndex];
-  proxyRotation[username].currentIndex = 
-    (proxyRotation[username].currentIndex + 1) % client.proxies.length;
-
-  return proxy;
-}
-
-// Получение текущего прокси без ротации
-function getCurrentProxy(username) {
-  const client = clientsConfig[username];
-  if (!client || !client.proxies || client.proxies.length === 0) {
-    return null;
-  }
-
-  if (!proxyRotation[username]) {
-    proxyRotation[username] = { currentIndex: 0 };
-  }
-
-  return client.proxies[proxyRotation[username].currentIndex];
-}
-
-// Парсинг прокси строки
-function parseProxy(proxyString) {
-  const parts = proxyString.split(':');
-  if (parts.length >= 4) {
-    return {
-      host: parts[0],
-      port: parseInt(parts[1]),
-      username: parts[2],
-      password: parts[3]
+// Получить всех клиентов
+app.get('/api/clients', (req, res) => {
+  const clients = {};
+  Object.keys(clientsConfig).forEach(clientName => {
+    clients[clientName] = {
+      totalProxies: clientProxies[clientName]?.length || 0,
+      currentProxy: getCurrentProxy(clientName)?.split('@')[1],
+      rotationCount: rotationCounters[clientName] || 0,
+      activeTunnels: activeTunnels[clientName]?.size || 0,
+      proxies: clientsConfig[clientName].proxies.map(p => p.split('@')[1])
     };
+  });
+  
+  res.json({
+    success: true,
+    clients,
+    totalClients: Object.keys(clients).length
+  });
+});
+
+// Добавить клиента
+app.post('/api/add-client', async (req, res) => {
+  const { clientName, password, proxies } = req.body;
+  
+  if (!clientName || !password) {
+    return res.status(400).json({ error: 'clientName and password are required' });
   }
-  return null;
-}
-
-// API Endpoints
-
-// Статус сервера
-app.get('/status', (req, res) => {
-  const stats = {
-    status: 'running',
-    port: PORT,
-    tcp_proxy: `${TCP_DOMAIN}:${TCP_PORT}`,
-    public_domain: PUBLIC_DOMAIN,
-    uptime: process.uptime(),
-    clients: Object.keys(clientsConfig).length,
-    blacklisted_ips: ipBlacklist.size,
-    timestamp: new Date().toISOString()
+  
+  if (clientsConfig[clientName]) {
+    return res.status(409).json({ error: 'Client already exists' });
+  }
+  
+  clientsConfig[clientName] = {
+    password,
+    proxies: proxies || []
   };
+  
+  await saveConfig();
+  initializeClients();
+  
+  console.log(`➕ Added new client: ${clientName} with ${proxies?.length || 0} proxies`);
+  
+  res.json({
+    success: true,
+    message: `Client ${clientName} added successfully`,
+    client: {
+      name: clientName,
+      totalProxies: proxies?.length || 0
+    }
+  });
+});
 
-  // Добавляем статистику по клиентам
-  stats.client_stats = {};
-  Object.keys(clientsConfig).forEach(username => {
-    const client = clientsConfig[username];
-    stats.client_stats[username] = {
-      proxies: client.proxies ? client.proxies.length : 0,
-      current_proxy_index: proxyRotation[username]?.currentIndex || 0
+// Удалить клиента
+app.delete('/api/remove-client/:clientName', async (req, res) => {
+  const { clientName } = req.params;
+  
+  if (!clientsConfig[clientName]) {
+    return res.status(404).json({ error: 'Client not found' });
+  }
+  
+  delete clientsConfig[clientName];
+  await saveConfig();
+  initializeClients();
+  
+  console.log(`➖ Removed client: ${clientName}`);
+  
+  res.json({
+    success: true,
+    message: `Client ${clientName} removed successfully`
+  });
+});
+
+// Добавить прокси к клиенту
+app.post('/api/add-proxy', async (req, res) => {
+  const { clientName, proxy } = req.body;
+  
+  if (!clientName || !proxy) {
+    return res.status(400).json({ error: 'clientName and proxy are required' });
+  }
+  
+  if (!clientsConfig[clientName]) {
+    return res.status(404).json({ error: 'Client not found' });
+  }
+  
+  // Проверяем формат прокси
+  if (!proxy.startsWith('http://') || !proxy.includes('@')) {
+    return res.status(400).json({ error: 'Invalid proxy format. Use: http://user:pass@host:port' });
+  }
+  
+  if (clientsConfig[clientName].proxies.includes(proxy)) {
+    return res.status(409).json({ error: 'Proxy already exists for this client' });
+  }
+  
+  clientsConfig[clientName].proxies.push(proxy);
+  await saveConfig();
+  initializeClients();
+  
+  console.log(`➕ Added proxy to ${clientName}: ${proxy.split('@')[1]}`);
+  
+  res.json({
+    success: true,
+    message: `Proxy added to ${clientName}`,
+    proxy: proxy.split('@')[1],
+    totalProxies: clientsConfig[clientName].proxies.length
+  });
+});
+
+// Удалить прокси у клиента
+app.delete('/api/remove-proxy', async (req, res) => {
+  const { clientName, proxy } = req.body;
+  
+  if (!clientName || !proxy) {
+    return res.status(400).json({ error: 'clientName and proxy are required' });
+  }
+  
+  if (!clientsConfig[clientName]) {
+    return res.status(404).json({ error: 'Client not found' });
+  }
+  
+  // Ищем прокси по полному URL или по host:port
+  let proxyToRemove = null;
+  if (proxy.startsWith('http://')) {
+    proxyToRemove = proxy;
+  } else {
+    proxyToRemove = clientsConfig[clientName].proxies.find(p => p.includes(proxy));
+  }
+  
+  if (!proxyToRemove) {
+    return res.status(404).json({ error: 'Proxy not found for this client' });
+  }
+  
+  clientsConfig[clientName].proxies = clientsConfig[clientName].proxies.filter(p => p !== proxyToRemove);
+  await saveConfig();
+  initializeClients();
+  
+  console.log(`➖ Removed proxy from ${clientName}: ${proxyToRemove.split('@')[1]}`);
+  
+  res.json({
+    success: true,
+    message: `Proxy removed from ${clientName}`,
+    proxy: proxyToRemove.split('@')[1],
+    totalProxies: clientsConfig[clientName].proxies.length
+  });
+});
+
+// Ротация прокси для клиента (для Telegram бота)
+app.post('/api/rotate-client', async (req, res) => {
+  const { clientName } = req.body;
+  
+  if (!clientName) {
+    return res.status(400).json({ error: 'clientName is required' });
+  }
+  
+  if (!clientsConfig[clientName]) {
+    return res.status(404).json({ error: 'Client not found' });
+  }
+  
+  const oldProxy = getCurrentProxy(clientName);
+  const newProxy = await rotateProxy(clientName);
+  const killed = closeUserTunnels(clientName);
+  
+  console.log(`[API] Telegram rotate client=${clientName} killed=${killed} ${oldProxy?.split('@')[1]} -> ${newProxy?.split('@')[1]}`);
+  
+  res.json({
+    success: true,
+    message: `Proxy rotated for ${clientName}`,
+    oldProxy: oldProxy?.split('@')[1],
+    newProxy: newProxy?.split('@')[1],
+    rotationCount: rotationCounters[clientName],
+    closedTunnels: killed
+  });
+});
+
+// ====== ОРИГИНАЛЬНЫЕ ФУНКЦИИ ПРОКСИ СЕРВЕРА ======
+
+function closeUserTunnels(username) {
+  const set = activeTunnels[username];
+  if (!set) return 0;
+  let n = 0;
+  for (const pair of set) {
+    try { pair.clientSocket.destroy(); } catch {}
+    try { pair.proxySocket.destroy(); } catch {}
+    n++;
+  }
+  set.clear();
+  return n;
+}
+
+function parseProxyUrl(proxyUrl) {
+  try {
+    const u = new URL(proxyUrl);
+    return { host: u.hostname, port: +u.port, username: u.username, password: u.password };
+  } catch { return null; }
+}
+
+function getCurrentProxy(username) {
+  const list = currentProxies[username];
+  if (!list) return null;
+  for (let i = 0; i < list.length; i++) {
+    if (!blockedProxies.has(list[i])) return list[i];
+  }
+  return list[0] || null;
+}
+
+async function rotateProxy(username) {
+  lastRotationTime.set(username, Date.now());
+
+  const list = currentProxies[username];
+  if (!list || list.length <= 1) return getCurrentProxy(username);
+
+  const oldProxy = list.shift();
+  list.push(oldProxy);
+  rotationCounters[username]++;
+
+  // Пропускаем заблокированные прокси
+  let attempts = 0;
+  while (blockedProxies.has(list[0]) && attempts < list.length) {
+    const blocked = list.shift();
+    list.push(blocked);
+    attempts++;
+  }
+
+  await new Promise(resolve => setTimeout(resolve, 500));
+
+  const newProxy = list[0];
+  console.log(`🔄 ROTATE ${username}: ${oldProxy.split('@')[1]} -> ${newProxy.split('@')[1]} (#${rotationCounters[username]}) [CONCURRENT]`);
+  return newProxy;
+}
+
+function authenticate(authHeader) {
+  if (!authHeader || !authHeader.startsWith('Basic ')) return null;
+  try {
+    const [u, p] = Buffer.from(authHeader.split(' ')[1], 'base64').toString().split(':');
+    return users[u] === p ? u : null;
+  } catch { return null; }
+}
+
+// ====== ОРИГИНАЛЬНЫЕ API ENDPOINTS ======
+const PUBLIC_HOST = (process.env.PUBLIC_HOST || 'nozomi.proxy.rlwy.net:58990').toLowerCase();
+const EXTRA_HOSTS = (process.env.EXTRA_HOSTS || '')
+  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+
+const SELF_HOSTNAMES = new Set([
+  PUBLIC_HOST.split(':')[0],
+  ...EXTRA_HOSTS.map(h => h.split(':')[0]),
+  ...(process.env.RAILWAY_STATIC_URL ? [String(process.env.RAILWAY_STATIC_URL).toLowerCase().split(':')[0]] : []),
+  ...(process.env.RAILWAY_PUBLIC_DOMAIN ? [String(process.env.RAILWAY_PUBLIC_DOMAIN).toLowerCase().split(':')[0]] : [])
+].filter(Boolean));
+
+function isSelfApiRequest(req) {
+  try {
+    if (req.url.startsWith('http://') || req.url.startsWith('https://')) {
+      const u = new URL(req.url);
+      if (SELF_HOSTNAMES.has(u.hostname.toLowerCase())) {
+        const p = u.pathname;
+        return p === '/' || p.startsWith('/status') || p.startsWith('/current') || p.startsWith('/rotate') ||
+               p.startsWith('/block') || p.startsWith('/unblock') || p.startsWith('/blocked') || p.startsWith('/myip') ||
+               p.startsWith('/api/');
+      }
+    }
+    const hostHeader = (req.headers.host || '').toLowerCase();
+    const onlyHost = hostHeader.split(':')[0];
+    if (SELF_HOSTNAMES.has(onlyHost)) {
+      const p = (req.url || '').split('?')[0];
+      return p === '/' || p.startsWith('/status') || p.startsWith('/current') || p.startsWith('/rotate') ||
+             p.startsWith('/block') || p.startsWith('/unblock') || p.startsWith('/blocked') || p.startsWith('/myip') ||
+             p.startsWith('/api/');
+    }
+  } catch {}
+  return false;
+}
+
+app.use((req, res, next) => { res.setHeader('Connection', 'close'); next(); });
+
+const upstreamAgent = new http.Agent({
+  keepAlive: true,
+  maxSockets: 256,
+  maxFreeSockets: 32,
+  timeout: 60000,
+  keepAliveMsecs: 10000,
+});
+
+// Оригинальные API endpoints
+app.post('/rotate', async (req, res) => {
+  const user = authenticate(req.headers['authorization']);
+  if (!user) return res.status(401).json({ error: 'Unauthorized' });
+
+  const oldProxy = getCurrentProxy(user);
+  const newProxy = await rotateProxy(user);
+  const killed = closeUserTunnels(user);
+
+  console.log(`[API] POST /rotate user=${user} killed=${killed} ${oldProxy?.split('@')[1]} -> ${newProxy?.split('@')[1]} [CONCURRENT]`);
+
+  res.json({
+    success: true,
+    message: 'Proxy rotated (concurrent mode)',
+    oldProxy: oldProxy?.split('@')[1],
+    newProxy: newProxy?.split('@')[1],
+    rotationCount: rotationCounters[user],
+    totalProxies: currentProxies[user].length,
+    blockedProxies: blockedProxies.size,
+    closedTunnels: killed,
+    concurrentMode: true,
+    rotationTime: Date.now() - (lastRotationTime.get(user) || Date.now())
+  });
+});
+
+app.get('/current', (req, res) => {
+  const user = authenticate(req.headers['authorization']);
+  if (!user) return res.status(401).json({ error: 'Unauthorized' });
+
+  const cur = getCurrentProxy(user);
+  console.log(`[API] GET /current user=${user} -> ${cur?.split('@')[1]}`);
+
+  res.json({
+    user,
+    currentProxy: cur?.split('@')[1],
+    fullProxy: cur,
+    totalProxies: currentProxies[user].length,
+    rotationCount: rotationCounters[user],
+    activeTunnels: activeTunnels[user].size,
+    blockedProxies: blockedProxies.size,
+    concurrentMode: true,
+    lastRotation: lastRotationTime.get(user) || 0
+  });
+});
+
+app.get('/myip', async (req, res) => {
+  const user = authenticate(req.headers['authorization']);
+  if (!user) return res.status(401).json({ error: 'Unauthorized' });
+
+  const proxyUrl = getCurrentProxy(user);
+  if (!proxyUrl) return res.status(502).json({ error: 'No proxy available' });
+
+  const up = parseProxyUrl(proxyUrl);
+  if (!up) return res.status(502).json({ error: 'Invalid proxy config' });
+
+  console.log(`[API] GET /myip user=${user} via ${up.host}:${up.port}`);
+
+  const ipServices = [
+    { url: 'http://api.ipify.org?format=json', type: 'json' },
+    { url: 'http://ifconfig.me/ip', type: 'text' },
+    { url: 'http://icanhazip.com', type: 'text' },
+    { url: 'http://ident.me', type: 'text' }
+  ];
+
+  function fetchViaProxy(service) {
+    return new Promise((resolve, reject) => {
+      const serviceUrlObj = new URL(service.url);
+      const proxyOptions = {
+        hostname: up.host,
+        port: up.port,
+        path: service.url,
+        method: 'GET',
+        headers: {
+          'Proxy-Authorization': `Basic ${Buffer.from(`${up.username}:${up.password}`).toString('base64')}`,
+          'Host': serviceUrlObj.hostname,
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        },
+        agent: upstreamAgent,
+        timeout: 20000
+      };
+
+      const proxyReq = http.request(proxyOptions, (proxyRes) => {
+        let data = '';
+        proxyRes.on('data', chunk => data += chunk);
+        proxyRes.on('end', () => {
+          if (proxyRes.statusCode >= 200 && proxyRes.statusCode < 300) {
+            let ip = null;
+            if (service.type === 'json') {
+              try { ip = JSON.parse(data).ip; } catch {}
+            }
+            if (!ip) {
+              ip = data.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/)?.[0] ||
+                   data.match(/(?:[0-9a-fA-F]{1,4}:){1,7}[0-9a-fA-F]{1,4}/)?.[0] ||
+                   data.trim();
+            }
+            if (ip && /^[\d.:]+$/.test(ip)) return resolve({ ip, service: service.url });
+            return reject(new Error('Bad IP parse'));
+          } else {
+            return reject(new Error(`HTTP ${proxyRes.statusCode}`));
+          }
+        });
+      });
+
+      proxyReq.on('socket', s => { try { s.setNoDelay(true); s.setKeepAlive(true, 10000); } catch {} });
+      proxyReq.on('timeout', () => proxyReq.destroy(new Error('Timeout')));
+      proxyReq.on('error', reject);
+      proxyReq.end();
+    });
+  }
+
+  try {
+    const result = await Promise.any(ipServices.map(fetchViaProxy));
+    console.log(`[API] /myip result for ${user}: ${result.ip} via ${result.service}`);
+    return res.json({ ip: result.ip, proxy: `${up.host}:${up.port}`, service: result.service });
+  } catch (err) {
+    console.error(`[API] /myip all services failed for ${user}: ${err?.message}`);
+    return res.status(502).json({ error: 'Failed to get IP from all services', lastError: err?.message });
+  }
+});
+
+app.get('/status', (req, res) => {
+  let totalOverlapping = 0;
+  const overlappingList = [];
+  const clientNames = Object.keys(clientsConfig);
+  
+  for (let i = 0; i < clientNames.length; i++) {
+    for (let j = i + 1; j < clientNames.length; j++) {
+      const client1Name = clientNames[i];
+      const client2Name = clientNames[j];
+      const client1Set = allProxySets[client1Name];
+      const client2Set = allProxySets[client2Name];
+      const intersection = clientProxies[client1Name].filter(p => client2Set.has(p));
+      totalOverlapping += intersection.length;
+      overlappingList.push(...intersection.map(p => p.split('@')[1]));
+    }
+  }
+
+  const clients = {};
+  Object.keys(clientsConfig).forEach(clientName => {
+    clients[clientName] = {
+      totalProxies: clientProxies[clientName]?.length || 0,
+      currentProxy: getCurrentProxy(clientName)?.split('@')[1],
+      rotationCount: rotationCounters[clientName] || 0,
+      activeTunnels: activeTunnels[clientName]?.size || 0,
+      lastRotation: lastRotationTime.get(clientName) || 0
     };
   });
 
-  res.json(stats);
-});
-
-// Health check
-app.get('/health', (req, res) => {
-  res.status(200).send('OK');
-});
-
-// 🔄 УЛУЧШЕННЫЙ /myip endpoint с принудительным обновлением соединений
-app.get('/myip', (req, res) => {
-  const clientIP = getClientIP(req);
-  
-  // Добавляем заголовки для предотвращения кеширования
-  res.set({
-    'Content-Type': 'text/plain',
-    'Cache-Control': 'no-cache, no-store, must-revalidate',
-    'Pragma': 'no-cache',
-    'Expires': '0',
-    'Connection': 'close' // 🔄 Принудительно закрываем соединение
+  res.json({
+    status: 'running',
+    platform: 'Railway TCP Proxy - Enhanced with Telegram Bot Management',
+    port: PORT,
+    publicHost: PUBLIC_HOST,
+    selfHostnames: [...SELF_HOSTNAMES],
+    totalBlockedProxies: blockedProxies.size,
+    concurrentMode: true,
+    telegramBotEnabled: true,
+    proxyIsolation: {
+      overlappingProxies: totalOverlapping,
+      overlappingList: [...new Set(overlappingList)],
+      fullyIsolated: totalOverlapping === 0
+    },
+    clients,
+    timestamp: new Date().toISOString()
   });
+});
+
+app.get('/', (req, res) => {
+  let totalOverlapping = 0;
+  const clientNames = Object.keys(clientsConfig);
   
-  res.send(clientIP);
+  for (let i = 0; i < clientNames.length; i++) {
+    for (let j = i + 1; j < clientNames.length; j++) {
+      const client1Name = clientNames[i];
+      const client2Name = clientNames[j];
+      const client1Set = allProxySets[client1Name];
+      const client2Set = allProxySets[client2Name];
+      const intersection = clientProxies[client1Name].filter(p => client2Set.has(p));
+      totalOverlapping += intersection.length;
+    }
+  }
+
+  const authInfo = Object.keys(clientsConfig).map(clientName => 
+    `${clientName}/${clientsConfig[clientName].password}`
+  ).join(' или ');
+
+  res.send(`
+    <h1>🚀 Railway Proxy Rotator - Enhanced with Telegram Bot</h1>
+    <pre>
+Public host: ${PUBLIC_HOST}
+Known hostnames: ${[...SELF_HOSTNAMES].join(', ')}
+
+Auth: Basic (${authInfo})
+
+⚡ Enhanced Features:
+- Telegram Bot Management API
+- Dynamic client/proxy management
+- File-based configuration persistence
+- Hot reload without restart
+- Concurrent rotation mode
+    </pre>
+    <h2>Original API:</h2>
+    <ul>
+      <li>GET /status - server status</li>
+      <li>GET /current (requires Basic) - current proxy</li>
+      <li>GET /myip (requires Basic) - get IP via proxy</li>
+      <li>POST /rotate (requires Basic) - rotate proxy</li>
+    </ul>
+    <h2>Telegram Bot API:</h2>
+    <ul>
+      <li>GET /api/clients - list all clients</li>
+      <li>POST /api/add-client - add new client</li>
+      <li>DELETE /api/remove-client/:name - remove client</li>
+      <li>POST /api/add-proxy - add proxy to client</li>
+      <li>DELETE /api/remove-proxy - remove proxy from client</li>
+      <li>POST /api/rotate-client - rotate proxy for client</li>
+    </ul>
+    <p>Total clients: ${Object.keys(clientsConfig).length}</p>
+    <p>Overlapping proxies: ${totalOverlapping}</p>
+    <p>Blocked proxies: ${blockedProxies.size}</p>
+  `);
 });
 
-// Обновление конфигурации от Telegram бота
-app.post('/update-config', (req, res) => {
-  try {
-    const { clients } = req.body;
-    
-    if (!clients || typeof clients !== 'object') {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Invalid clients configuration' 
-      });
-    }
+// ====== ПРОКСИ СЕРВЕР (ОРИГИНАЛЬНЫЙ КОД) ======
+const server = http.createServer();
 
-    clientsConfig = clients;
-    
-    // Обновляем ротацию для новых клиентов
-    Object.keys(clientsConfig).forEach(username => {
-      if (clientsConfig[username].proxies && clientsConfig[username].proxies.length > 0) {
-        if (!proxyRotation[username]) {
-          proxyRotation[username] = { currentIndex: 0 };
-        }
-      }
-    });
+async function handleHttpProxy(req, res, user) {
+  const up = parseProxyUrl(getCurrentProxy(user));
+  if (!up) { res.writeHead(502); return res.end('502 No upstream'); }
 
-    saveConfig();
-    console.log('📥 Configuration received from Telegram Bot');
-    console.log(`✅ Updated configuration: ${Object.keys(clientsConfig).length} clients`);
-    
-    res.json({ 
-      success: true, 
-      message: 'Configuration updated successfully',
-      clients: Object.keys(clientsConfig).length
-    });
-  } catch (error) {
-    console.error('❌ Error updating config:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
-    });
-  }
-});
+  console.log(`HTTP: ${user} -> ${up.host}:${up.port} -> ${req.url}`);
 
-// 🔄 УЛУЧШЕННАЯ РУЧНАЯ РОТАЦИЯ ПРОКСИ с очисткой соединений
-app.post('/rotate-proxy', (req, res) => {
-  try {
-    const { username } = req.body;
-    
-    if (!username) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Username is required' 
-      });
-    }
-
-    if (!clientsConfig[username]) {
-      return res.status(404).json({ 
-        success: false, 
-        error: 'Client not found' 
-      });
-    }
-
-    const client = clientsConfig[username];
-    if (!client.proxies || client.proxies.length === 0) {
-      return res.status(404).json({ 
-        success: false, 
-        error: 'No proxies available for this client' 
-      });
-    }
-
-    // Инициализируем ротацию если не существует
-    if (!proxyRotation[username]) {
-      proxyRotation[username] = { currentIndex: 0 };
-    }
-
-    const oldIndex = proxyRotation[username].currentIndex;
-    const oldProxy = client.proxies[oldIndex];
-
-    // Переходим к следующему прокси
-    proxyRotation[username].currentIndex = 
-      (proxyRotation[username].currentIndex + 1) % client.proxies.length;
-    
-    const newProxy = client.proxies[proxyRotation[username].currentIndex];
-    const currentIndex = proxyRotation[username].currentIndex;
-    
-    // 🔄 ОЧИЩАЕМ KEEP-ALIVE СОЕДИНЕНИЯ
-    clearKeepAliveConnections(username);
-    
-    // 🧹 Принудительная сборка мусора если доступна
-    if (global.gc) {
-      global.gc();
-    }
-    
-    console.log(`🔄 Manual proxy rotation for ${username}: ${oldProxy} → ${newProxy} (index: ${oldIndex} → ${currentIndex})`);
-    console.log(`🧹 Cleared keep-alive connections for ${username}`);
-    
-    res.json({ 
-      success: true, 
-      message: 'Proxy rotated successfully',
-      username: username,
-      old_proxy: oldProxy,
-      current_proxy: newProxy,
-      old_index: oldIndex,
-      current_index: currentIndex,
-      total_proxies: client.proxies.length,
-      connections_cleared: true
-    });
-    
-  } catch (error) {
-    console.error('❌ Error rotating proxy:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
-    });
-  }
-});
-
-// 📋 ПОЛУЧИТЬ ТЕКУЩИЙ ПРОКСИ (без ротации)
-app.get('/current-proxy/:username', (req, res) => {
-  try {
-    const { username } = req.params;
-    
-    if (!clientsConfig[username]) {
-      return res.status(404).json({ 
-        success: false, 
-        error: 'Client not found' 
-      });
-    }
-
-    const client = clientsConfig[username];
-    if (!client.proxies || client.proxies.length === 0) {
-      return res.status(404).json({ 
-        success: false, 
-        error: 'No proxies available for this client' 
-      });
-    }
-
-    if (!proxyRotation[username]) {
-      proxyRotation[username] = { currentIndex: 0 };
-    }
-
-    const currentIndex = proxyRotation[username].currentIndex;
-    const currentProxy = client.proxies[currentIndex];
-    
-    res.json({ 
-      success: true,
-      username: username,
-      current_proxy: currentProxy,
-      current_index: currentIndex,
-      total_proxies: client.proxies.length
-    });
-    
-  } catch (error) {
-    console.error('❌ Error getting current proxy:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
-    });
-  }
-});
-
-// 🎯 УСТАНОВИТЬ КОНКРЕТНЫЙ ПРОКСИ ПО ИНДЕКСУ с очисткой соединений
-app.post('/set-proxy-index', (req, res) => {
-  try {
-    const { username, index } = req.body;
-    
-    if (!username) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Username is required' 
-      });
-    }
-
-    if (index === undefined || index === null) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Index is required' 
-      });
-    }
-
-    if (!clientsConfig[username]) {
-      return res.status(404).json({ 
-        success: false, 
-        error: 'Client not found' 
-      });
-    }
-
-    const client = clientsConfig[username];
-    if (!client.proxies || client.proxies.length === 0) {
-      return res.status(404).json({ 
-        success: false, 
-        error: 'No proxies available for this client' 
-      });
-    }
-
-    const proxyIndex = parseInt(index);
-    if (proxyIndex < 0 || proxyIndex >= client.proxies.length) {
-      return res.status(400).json({ 
-        success: false, 
-        error: `Invalid index. Must be between 0 and ${client.proxies.length - 1}` 
-      });
-    }
-
-    // Устанавливаем конкретный индекс
-    if (!proxyRotation[username]) {
-      proxyRotation[username] = { currentIndex: 0 };
-    }
-    
-    const oldIndex = proxyRotation[username].currentIndex;
-    const oldProxy = client.proxies[oldIndex];
-    
-    proxyRotation[username].currentIndex = proxyIndex;
-    const selectedProxy = client.proxies[proxyIndex];
-    
-    // 🔄 ОЧИЩАЕМ KEEP-ALIVE СОЕДИНЕНИЯ
-    clearKeepAliveConnections(username);
-    
-    // 🧹 Принудительная сборка мусора если доступна
-    if (global.gc) {
-      global.gc();
-    }
-    
-    console.log(`🎯 Set proxy index for ${username}: ${oldProxy} → ${selectedProxy} (index: ${oldIndex} → ${proxyIndex})`);
-    console.log(`🧹 Cleared keep-alive connections for ${username}`);
-    
-    res.json({ 
-      success: true, 
-      message: 'Proxy index set successfully',
-      username: username,
-      old_proxy: oldProxy,
-      current_proxy: selectedProxy,
-      old_index: oldIndex,
-      current_index: proxyIndex,
-      total_proxies: client.proxies.length,
-      connections_cleared: true
-    });
-    
-  } catch (error) {
-    console.error('❌ Error setting proxy index:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
-    });
-  }
-});
-
-// 📊 ПОЛУЧИТЬ ВСЕ ПРОКСИ КЛИЕНТА
-app.get('/proxies/:username', (req, res) => {
-  try {
-    const { username } = req.params;
-    
-    if (!clientsConfig[username]) {
-      return res.status(404).json({ 
-        success: false, 
-        error: 'Client not found' 
-      });
-    }
-
-    const client = clientsConfig[username];
-    if (!client.proxies || client.proxies.length === 0) {
-      return res.status(404).json({ 
-        success: false, 
-        error: 'No proxies available for this client' 
-      });
-    }
-
-    if (!proxyRotation[username]) {
-      proxyRotation[username] = { currentIndex: 0 };
-    }
-
-    res.json({ 
-      success: true,
-      username: username,
-      proxies: client.proxies,
-      current_index: proxyRotation[username].currentIndex,
-      total_proxies: client.proxies.length
-    });
-    
-  } catch (error) {
-    console.error('❌ Error getting proxies:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
-    });
-  }
-});
-
-// ✅ ИСПРАВЛЕННЫЙ HTTP прокси endpoint
-app.use('/proxy', authenticateClient, (req, res, next) => {
-  const username = req.clientUsername;
-  const proxy = getCurrentProxy(username); // Используем текущий прокси без автоматической ротации
-  
-  if (!proxy) {
-    return res.status(503).json({ 
-      error: 'No proxies available for this client' 
-    });
-  }
-
-  const parsedProxy = parseProxy(proxy);
-  if (!parsedProxy) {
-    return res.status(500).json({ 
-      error: 'Invalid proxy configuration' 
-    });
-  }
-
-  console.log(`🔄 HTTP Proxy for ${username}: ${parsedProxy.host}:${parsedProxy.port}`);
-
-  // Создаем прокси middleware для HTTP запросов
-  const proxyMiddleware = createProxyMiddleware({
-    target: `http://${parsedProxy.host}:${parsedProxy.port}`,
-    changeOrigin: true,
-    pathRewrite: {
-      '^/proxy': ''
+  const options = {
+    hostname: up.host,
+    port: up.port,
+    path: req.url,
+    method: req.method,
+    headers: {
+      ...req.headers,
+      'Proxy-Authorization': `Basic ${Buffer.from(`${up.username}:${up.password}`).toString('base64')}`,
     },
-    onError: (err, req, res) => {
-      console.error(`❌ HTTP Proxy error for ${username}:`, err.message);
-      if (!res.headersSent) {
-        res.status(502).json({ error: 'Proxy connection failed', details: err.message });
-      }
-    },
-    onProxyReq: (proxyReq, req, res) => {
-      // Добавляем аутентификацию для upstream прокси
-      const proxyAuth = Buffer.from(`${parsedProxy.username}:${parsedProxy.password}`).toString('base64');
-      proxyReq.setHeader('Proxy-Authorization', `Basic ${proxyAuth}`);
-      
-      console.log(`➡️ HTTP Proxying ${req.method} ${req.url} for ${username} via ${parsedProxy.host}:${parsedProxy.port}`);
-    },
-    onProxyRes: (proxyRes, req, res) => {
-      console.log(`⬅️ HTTP Response ${proxyRes.statusCode} for ${req.clientUsername}`);
-    }
+    agent: upstreamAgent,
+    timeout: 45000
+  };
+  delete options.headers['proxy-authorization'];
+
+  const proxyReq = http.request(options, (proxyRes) => {
+    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+    proxyRes.pipe(res);
   });
 
-  proxyMiddleware(req, res, next);
+  proxyReq.on('socket', s => { try { s.setNoDelay(true); s.setKeepAlive(true, 10000); } catch {} });
+  proxyReq.on('timeout', () => proxyReq.destroy(new Error('Upstream timeout')));
+  proxyReq.on('error', (err) => {
+    console.error(`HTTP upstream error (${user}):`, err.message);
+    if (!res.headersSent) res.writeHead(502);
+    res.end('502 Bad Gateway - Proxy error');
+  });
+
+  req.pipe(proxyReq);
+}
+
+server.on('request', (req, res) => {
+  if (isSelfApiRequest(req)) {
+    const host = req.headers.host || '(no-host)';
+    console.log(`[SELF-API] ${req.method} ${req.url} Host:${host}`);
+    return app(req, res);
+  }
+
+  const user = authenticate(req.headers['proxy-authorization']);
+  if (!user) {
+    res.writeHead(407, { 'Proxy-Authenticate': 'Basic realm="Proxy"' });
+    return res.end('407 Proxy Authentication Required');
+  }
+
+  handleHttpProxy(req, res, user);
 });
 
-// Управление блэклистом (только для админов)
-app.post('/blacklist/add', (req, res) => {
-  const { ip, admin_key } = req.body;
-  
-  if (admin_key !== process.env.ADMIN_KEY) {
-    return res.status(403).json({ error: 'Admin access required' });
+function tryConnect(req, clientSocket, user) {
+  const up = parseProxyUrl(getCurrentProxy(user));
+  if (!up) {
+    clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+    return clientSocket.end();
   }
 
-  if (!ip) {
-    return res.status(400).json({ error: 'IP address required' });
-  }
+  console.log(`CONNECT: ${user} -> ${up.host}:${up.port} -> ${req.url}`);
+  const proxySocket = net.createConnection(up.port, up.host);
 
-  ipBlacklist.add(ip);
-  saveBlacklist();
-  console.log(`🚫 Added to blacklist: ${ip}`);
-  
-  res.json({ success: true, message: `IP ${ip} added to blacklist` });
-});
+  const pair = { clientSocket, proxySocket };
+  activeTunnels[user]?.add(pair);
 
-app.post('/blacklist/remove', (req, res) => {
-  const { ip, admin_key } = req.body;
-  
-  if (admin_key !== process.env.ADMIN_KEY) {
-    return res.status(403).json({ error: 'Admin access required' });
-  }
+  const cleanup = () => activeTunnels[user]?.delete(pair);
+  proxySocket.on('close', cleanup);
+  clientSocket.on('close', cleanup);
 
-  if (!ip) {
-    return res.status(400).json({ error: 'IP address required' });
-  }
+  try { proxySocket.setNoDelay(true); proxySocket.setKeepAlive(true, 10000); } catch {}
+  try { clientSocket.setNoDelay(true); clientSocket.setKeepAlive(true, 10000); } catch {}
 
-  ipBlacklist.delete(ip);
-  saveBlacklist();
-  console.log(`✅ Removed from blacklist: ${ip}`);
-  
-  res.json({ success: true, message: `IP ${ip} removed from blacklist` });
-});
+  proxySocket.setTimeout(45000, () => proxySocket.destroy(new Error('upstream timeout')));
+  clientSocket.setTimeout(45000, () => clientSocket.destroy(new Error('client timeout')));
 
-// Получить список блэклиста
-app.get('/blacklist', (req, res) => {
-  const { admin_key } = req.query;
-  
-  if (admin_key !== process.env.ADMIN_KEY) {
-    return res.status(403).json({ error: 'Admin access required' });
-  }
-
-  res.json({ blacklist: [...ipBlacklist] });
-});
-
-// ✅ ДОБАВЛЯЕМ TCP ПРОКСИ ФУНКЦИОНАЛЬНОСТЬ
-const server = http.createServer(app);
-
-// Обработка CONNECT запросов для TCP/HTTPS прокси
-server.on('connect', (req, clientSocket, head) => {
-  console.log(`🔌 CONNECT request: ${req.url}`);
-  console.log(`🔍 CONNECT headers:`, req.headers);
-  
-  const username = authenticateConnect(req);
-  if (!username) {
-    console.log('❌ CONNECT: Authentication failed');
-    clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Proxy"\r\n\r\n');
-    clientSocket.end();
-    return;
-  }
-
-  const proxy = getCurrentProxy(username); // Используем текущий прокси без автоматической ротации
-  if (!proxy) {
-    console.log(`❌ CONNECT: No proxy available for ${username}`);
-    clientSocket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
-    clientSocket.end();
-    return;
-  }
-
-  const parsedProxy = parseProxy(proxy);
-  if (!parsedProxy) {
-    console.log(`❌ CONNECT: Invalid proxy config for ${username}`);
-    clientSocket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
-    clientSocket.end();
-    return;
-  }
-
-  console.log(`🔄 TCP Proxy for ${username}: ${parsedProxy.host}:${parsedProxy.port} -> ${req.url}`);
-
-  // Подключаемся к upstream прокси
-  const proxySocket = net.createConnection(parsedProxy.port, parsedProxy.host);
-  
   proxySocket.on('connect', () => {
-    // Отправляем CONNECT запрос к upstream прокси
-    const proxyAuth = Buffer.from(`${parsedProxy.username}:${parsedProxy.password}`).toString('base64');
-    const connectRequest = `CONNECT ${req.url} HTTP/1.1\r\nProxy-Authorization: Basic ${proxyAuth}\r\n\r\n`;
-    
-    console.log(`📤 Sending CONNECT to upstream: ${parsedProxy.host}:${parsedProxy.port}`);
-    proxySocket.write(connectRequest);
+    const auth = Buffer.from(`${up.username}:${up.password}`).toString('base64');
+    const connectReq =
+      `CONNECT ${req.url} HTTP/1.1\r\n` +
+      `Host: ${req.url}\r\n` +
+      `Proxy-Authorization: Basic ${auth}\r\n` +
+      `Proxy-Connection: keep-alive\r\n` +
+      `Connection: keep-alive\r\n\r\n`;
+    proxySocket.write(connectReq);
   });
 
-  let headersParsed = false;
+  let established = false;
   proxySocket.on('data', (data) => {
-    if (!headersParsed) {
-      const response = data.toString();
-      console.log(`📥 Upstream response: ${response.split('\r\n')[0]}`);
-      
-      if (response.includes('200 Connection established') || response.includes('200 OK')) {
-        console.log(`✅ TCP Tunnel established for ${username}`);
-        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-        headersParsed = true;
-        
-        // Начинаем туннелирование данных
+    if (!established) {
+      const line = data.toString('utf8').split('\r\n')[0];
+      if (/^HTTP\/1\.[01]\s+200/i.test(line)) {
+        established = true;
+        try { clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n'); } catch {}
         clientSocket.pipe(proxySocket);
         proxySocket.pipe(clientSocket);
       } else {
-        console.log(`❌ TCP Proxy connection failed for ${username}: ${response.split('\r\n')[0]}`);
-        clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+        try { clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n'); } catch {}
         clientSocket.end();
         proxySocket.end();
       }
@@ -719,32 +717,64 @@ server.on('connect', (req, clientSocket, head) => {
   });
 
   proxySocket.on('error', (err) => {
-    console.error(`❌ TCP Proxy error for ${username}:`, err.message);
-    if (!headersParsed) {
-      clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
-    }
+    console.error(`CONNECT upstream error (${user}):`, err.message);
+    try { clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n'); } catch {}
     clientSocket.end();
   });
 
-  clientSocket.on('error', (err) => {
-    console.error(`❌ Client socket error for ${username}:`, err.message);
-    proxySocket.end();
-  });
+  clientSocket.on('error', () => { try { proxySocket.destroy(); } catch {} });
+}
+
+server.on('connect', (req, clientSocket) => {
+  const user = authenticate(req.headers['proxy-authorization']);
+  if (!user) {
+    clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Proxy"\r\n\r\n');
+    return clientSocket.end();
+  }
+  tryConnect(req, clientSocket, user);
 });
 
-// Запуск сервера
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 FULL Proxy server (HTTP + TCP) running on port ${PORT}`);
-  console.log(`🌐 TCP Proxy: ${TCP_DOMAIN}:${TCP_PORT}`);
-  console.log(`🌐 Public Domain: ${PUBLIC_DOMAIN}`);
-  console.log('🤖 Managed by Telegram Bot');
-  console.log('🔄 Manual proxy rotation: ENABLED');
-  console.log('⚡ Tampermonkey control: READY');
-  console.log('🧹 Keep-alive connection clearing: ENABLED');
-  console.log('✅ Server started successfully');
+// ====== ЗАПУСК ======
+const PORT = process.env.PORT || process.env.RAILWAY_PORT || 8080;
+
+async function startServer() {
+  await loadConfig();
+  initializeClients();
   
-  // Загружаем конфигурации при запуске
-  loadConfig();
-  loadBlacklist();
-  
-});
+  server.listen(PORT, '0.0.0.0', () => {
+    let totalOverlapping = 0;
+    const clientNames = Object.keys(clientsConfig);
+    
+    for (let i = 0; i < clientNames.length; i++) {
+      for (let j = i + 1; j < clientNames.length; j++) {
+        const client1Name = clientNames[i];
+        const client2Name = clientNames[j];
+        const client1Set = allProxySets[client1Name];
+        const client2Set = allProxySets[client2Name];
+        const intersection = clientProxies[client1Name].filter(p => client2Set.has(p));
+        totalOverlapping += intersection.length;
+      }
+    }
+
+    console.log(`🚀 Enhanced Proxy server running on port ${PORT}`);
+    console.log(`🌐 Public (TCP Proxy): ${PUBLIC_HOST}`);
+    console.log(`✅ API self hostnames: ${[...SELF_HOSTNAMES].join(', ')}`);
+    console.log(`🤖 Telegram Bot API enabled`);
+    
+    Object.keys(clientsConfig).forEach(clientName => {
+      console.log(`📊 ${clientName}: ${clientProxies[clientName]?.length || 0} proxies`);
+    });
+    
+    console.log(`⚡ Concurrent mode: NO rotation locks`);
+    console.log(`🔍 Overlapping proxies: ${totalOverlapping}`);
+    console.log(`💾 Configuration file: ${CONFIG_FILE}`);
+
+    if (totalOverlapping > 0) {
+      console.warn(`⚠️  WARNING: ${totalOverlapping} overlapping proxies may cause interference`);
+    } else {
+      console.log(`✅ Fully isolated proxy pools - safe for concurrent rotation`);
+    }
+  });
+}
+
+startServer().catch(console.error);

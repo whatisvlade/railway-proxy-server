@@ -1,25 +1,11 @@
 {
-  "name": "enhanced-proxy-server",
+  "name": "node enhanced-proxy-server.js",
   "version": "1.0.0",
-  "description": "Railway TCP Proxy with Telegram Bot Management",
   "main": "enhanced-proxy-server.js",
   "scripts": {
-    "start": "node enhanced-proxy-server.js",
-    "dev": "node enhanced-proxy-server.js"
+    "start": "node node enhanced-proxy-server.js"
   },
   "dependencies": {
     "express": "^4.18.2"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  },
-  "keywords": [
-    "proxy",
-    "tcp",
-    "http",
-    "railway",
-    "telegram-bot"
-  ],
-  "author": "Enhanced Proxy Server",
-  "license": "MIT"
+  }
 }

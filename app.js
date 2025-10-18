@@ -157,7 +157,7 @@ function authenticateConnect(req) {
   return username;
 }
 
-// Получение следующего прокси для клиента
+// Получение следующего прокси для клиента (автоматическая ротация)
 function getNextProxy(username) {
   const client = clientsConfig[username];
   if (!client || !client.proxies || client.proxies.length === 0) {
@@ -173,6 +173,20 @@ function getNextProxy(username) {
     (proxyRotation[username].currentIndex + 1) % client.proxies.length;
 
   return proxy;
+}
+
+// Получение текущего прокси без ротации
+function getCurrentProxy(username) {
+  const client = clientsConfig[username];
+  if (!client || !client.proxies || client.proxies.length === 0) {
+    return null;
+  }
+
+  if (!proxyRotation[username]) {
+    proxyRotation[username] = { currentIndex: 0 };
+  }
+
+  return client.proxies[proxyRotation[username].currentIndex];
 }
 
 // Парсинг прокси строки
@@ -274,10 +288,224 @@ app.post('/update-config', (req, res) => {
   }
 });
 
+// 🔄 РУЧНАЯ РОТАЦИЯ ПРОКСИ (для Tampermonkey скрипта)
+app.post('/rotate-proxy', (req, res) => {
+  try {
+    const { username } = req.body;
+    
+    if (!username) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Username is required' 
+      });
+    }
+
+    if (!clientsConfig[username]) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Client not found' 
+      });
+    }
+
+    const client = clientsConfig[username];
+    if (!client.proxies || client.proxies.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'No proxies available for this client' 
+      });
+    }
+
+    // Инициализируем ротацию если не существует
+    if (!proxyRotation[username]) {
+      proxyRotation[username] = { currentIndex: 0 };
+    }
+
+    // Переходим к следующему прокси
+    proxyRotation[username].currentIndex = 
+      (proxyRotation[username].currentIndex + 1) % client.proxies.length;
+    
+    const newProxy = client.proxies[proxyRotation[username].currentIndex];
+    const currentIndex = proxyRotation[username].currentIndex;
+    
+    console.log(`🔄 Manual proxy rotation for ${username}: ${newProxy} (index: ${currentIndex})`);
+    
+    res.json({ 
+      success: true, 
+      message: 'Proxy rotated successfully',
+      username: username,
+      current_proxy: newProxy,
+      current_index: currentIndex,
+      total_proxies: client.proxies.length
+    });
+    
+  } catch (error) {
+    console.error('❌ Error rotating proxy:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+});
+
+// 📋 ПОЛУЧИТЬ ТЕКУЩИЙ ПРОКСИ (без ротации)
+app.get('/current-proxy/:username', (req, res) => {
+  try {
+    const { username } = req.params;
+    
+    if (!clientsConfig[username]) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Client not found' 
+      });
+    }
+
+    const client = clientsConfig[username];
+    if (!client.proxies || client.proxies.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'No proxies available for this client' 
+      });
+    }
+
+    if (!proxyRotation[username]) {
+      proxyRotation[username] = { currentIndex: 0 };
+    }
+
+    const currentIndex = proxyRotation[username].currentIndex;
+    const currentProxy = client.proxies[currentIndex];
+    
+    res.json({ 
+      success: true,
+      username: username,
+      current_proxy: currentProxy,
+      current_index: currentIndex,
+      total_proxies: client.proxies.length
+    });
+    
+  } catch (error) {
+    console.error('❌ Error getting current proxy:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+});
+
+// 🎯 УСТАНОВИТЬ КОНКРЕТНЫЙ ПРОКСИ ПО ИНДЕКСУ
+app.post('/set-proxy-index', (req, res) => {
+  try {
+    const { username, index } = req.body;
+    
+    if (!username) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Username is required' 
+      });
+    }
+
+    if (index === undefined || index === null) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Index is required' 
+      });
+    }
+
+    if (!clientsConfig[username]) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Client not found' 
+      });
+    }
+
+    const client = clientsConfig[username];
+    if (!client.proxies || client.proxies.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'No proxies available for this client' 
+      });
+    }
+
+    const proxyIndex = parseInt(index);
+    if (proxyIndex < 0 || proxyIndex >= client.proxies.length) {
+      return res.status(400).json({ 
+        success: false, 
+        error: `Invalid index. Must be between 0 and ${client.proxies.length - 1}` 
+      });
+    }
+
+    // Устанавливаем конкретный индекс
+    if (!proxyRotation[username]) {
+      proxyRotation[username] = { currentIndex: 0 };
+    }
+    
+    proxyRotation[username].currentIndex = proxyIndex;
+    const selectedProxy = client.proxies[proxyIndex];
+    
+    console.log(`🎯 Set proxy index for ${username}: ${selectedProxy} (index: ${proxyIndex})`);
+    
+    res.json({ 
+      success: true, 
+      message: 'Proxy index set successfully',
+      username: username,
+      current_proxy: selectedProxy,
+      current_index: proxyIndex,
+      total_proxies: client.proxies.length
+    });
+    
+  } catch (error) {
+    console.error('❌ Error setting proxy index:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+});
+
+// 📊 ПОЛУЧИТЬ ВСЕ ПРОКСИ КЛИЕНТА
+app.get('/proxies/:username', (req, res) => {
+  try {
+    const { username } = req.params;
+    
+    if (!clientsConfig[username]) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Client not found' 
+      });
+    }
+
+    const client = clientsConfig[username];
+    if (!client.proxies || client.proxies.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'No proxies available for this client' 
+      });
+    }
+
+    if (!proxyRotation[username]) {
+      proxyRotation[username] = { currentIndex: 0 };
+    }
+
+    res.json({ 
+      success: true,
+      username: username,
+      proxies: client.proxies,
+      current_index: proxyRotation[username].currentIndex,
+      total_proxies: client.proxies.length
+    });
+    
+  } catch (error) {
+    console.error('❌ Error getting proxies:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+});
+
 // ✅ ИСПРАВЛЕННЫЙ HTTP прокси endpoint
 app.use('/proxy', authenticateClient, (req, res, next) => {
   const username = req.clientUsername;
-  const proxy = getNextProxy(username);
+  const proxy = getCurrentProxy(username); // Используем текущий прокси без автоматической ротации
   
   if (!proxy) {
     return res.status(503).json({ 
@@ -386,7 +614,7 @@ server.on('connect', (req, clientSocket, head) => {
     return;
   }
 
-  const proxy = getNextProxy(username);
+  const proxy = getCurrentProxy(username); // Используем текущий прокси без автоматической ротации
   if (!proxy) {
     console.log(`❌ CONNECT: No proxy available for ${username}`);
     clientSocket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
@@ -459,17 +687,12 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`🌐 TCP Proxy: ${TCP_DOMAIN}:${TCP_PORT}`);
   console.log(`🌐 Public Domain: ${PUBLIC_DOMAIN}`);
   console.log('🤖 Managed by Telegram Bot');
-  console.log('🔥 Hot reload: ENABLED');
-  console.log('✅ HTTP Proxy: /proxy endpoint');
-  console.log('✅ TCP Proxy: CONNECT method support');
-  console.log('✅ Enhanced CONNECT authentication');
-  console.log('⚡ Concurrent mode: NO rotation locks');
+  console.log('🔄 Manual proxy rotation: ENABLED');
+  console.log('⚡ Tampermonkey control: READY');
   console.log('✅ Server started successfully');
   
   // Загружаем конфигурации при запуске
   loadConfig();
   loadBlacklist();
   
-  console.log('🔍 Overlapping proxies: 0');
-  console.log('✅ Fully isolated proxy pools - safe for concurrent rotation');
 });

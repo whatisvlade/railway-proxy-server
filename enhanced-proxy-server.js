@@ -1,19 +1,34 @@
-// app.js — Railway Proxy + Telegram Bot Management
+// telegram-bot.js — Telegram Bot для управления прокси клиентами (CORRECTED)
+const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
-const http = require('http');
-const https = require('https');
-const net = require('net');
-const { URL } = require('url');
 const fs = require('fs').promises;
 const path = require('path');
 
-const app = express();
-app.use(express.json());
+// ====== КОНФИГУРАЦИЯ С ОТЛАДКОЙ ======
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const ADMIN_IDS_STRING = process.env.ADMIN_IDS || '';
+const ADMIN_IDS = ADMIN_IDS_STRING.split(',').map(id => parseInt(id.trim())).filter(Boolean);
+const SUPER_ADMIN_ID = ADMIN_IDS[0]; // Первый ID = супер-админ
+const MANAGER_IDS = ADMIN_IDS.slice(1); // Остальные = менеджеры
 
-// ====== КОНФИГУРАЦИЯ С ФАЙЛОВЫМ ХРАНЕНИЕМ ======
+console.log('🔐 ОТЛАДКА АВТОРИЗАЦИИ:');
+console.log(`   BOT_TOKEN: ${BOT_TOKEN ? 'УСТАНОВЛЕН' : 'НЕ УСТАНОВЛЕН'}`);
+console.log(`   ADMIN_IDS_STRING: "${ADMIN_IDS_STRING}"`);
+console.log(`   ADMIN_IDS array: [${ADMIN_IDS.join(', ')}]`);
+console.log(`   SUPER_ADMIN_ID: ${SUPER_ADMIN_ID || 'НЕ УСТАНОВЛЕН'}`);
+console.log(`   MANAGER_IDS: [${MANAGER_IDS.join(', ')}]`);
+
+const PROXY_SERVER_URL = process.env.PROXY_SERVER_URL || 'http://localhost:8080';
+const API_AUTH = Buffer.from(`${process.env.API_USERNAME || 'telegram_bot'}:${process.env.API_PASSWORD || 'bot_secret_2024'}`).toString('base64');
+
 const CONFIG_FILE = path.join(__dirname, 'clients-config.json');
+const PORT = process.env.PORT || 8080;
 
-// Пустая конфигурация - все клиенты добавляются через Telegram бота
+// ====== ИНИЦИАЛИЗАЦИЯ ======
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+const app = express();
+app.use(express.json({ limit: '10mb' })); // Увеличиваем лимит для больших списков прокси
+
 let clientsConfig = {};
 
 // ====== ФУНКЦИИ УПРАВЛЕНИЯ КОНФИГУРАЦИЕЙ ======
@@ -21,9 +36,10 @@ async function loadConfig() {
   try {
     const data = await fs.readFile(CONFIG_FILE, 'utf8');
     clientsConfig = JSON.parse(data);
-    console.log('✅ Configuration loaded from file');
+    console.log('📁 Конфигурация загружена из файла');
   } catch (error) {
-    console.log('📝 Using empty configuration, creating config file...');
+    console.log('📝 Создаем новый файл конфигурации');
+    clientsConfig = {};
     await saveConfig();
   }
 }
@@ -31,771 +47,590 @@ async function loadConfig() {
 async function saveConfig() {
   try {
     await fs.writeFile(CONFIG_FILE, JSON.stringify(clientsConfig, null, 2));
-    console.log('💾 Configuration saved to file');
+    console.log('💾 Конфигурация клиентов сохранена');
   } catch (error) {
-    console.error('❌ Failed to save configuration:', error.message);
+    console.error('❌ Ошибка сохранения конфигурации:', error.message);
   }
 }
 
-// ====== ДИНАМИЧЕСКИЕ СТРУКТУРЫ ======
-let users = {};
-let clientProxies = {};
-let allProxySets = {};
-let currentProxies = {};
-let rotationCounters = {};
-const lastRotationTime = new Map();
-const activeTunnels = {};
-const blockedProxies = new Set();
-
-// ====== ИНИЦИАЛИЗАЦИЯ КЛИЕНТОВ ======
-function initializeClients() {
-  // Очищаем старые данные
-  users = {};
-  clientProxies = {};
-  allProxySets = {};
-  currentProxies = {};
-  rotationCounters = {};
-  
-  // Инициализируем из конфигурации
-  Object.keys(clientsConfig).forEach(clientName => {
-    const config = clientsConfig[clientName];
-    users[clientName] = config.password;
-    clientProxies[clientName] = [...config.proxies];
-    allProxySets[clientName] = new Set(config.proxies);
-    currentProxies[clientName] = [...config.proxies];
-    rotationCounters[clientName] = rotationCounters[clientName] || 0;
-    activeTunnels[clientName] = activeTunnels[clientName] || new Set();
-
-    console.log(`✅ Initialized client: ${clientName} with ${config.proxies.length} proxies`);
-  });
-
-  // Проверяем пересечения
-  checkProxyOverlaps();
-}
-
-function checkProxyOverlaps() {
-  const clientNames = Object.keys(clientsConfig);
-  for (let i = 0; i < clientNames.length; i++) {
-    for (let j = i + 1; j < clientNames.length; j++) {
-      const client1Name = clientNames[i];
-      const client2Name = clientNames[j];
-      const client1Set = allProxySets[client1Name];
-      const client2Set = allProxySets[client2Name];
-      const intersection = clientProxies[client1Name].filter(p => client2Set.has(p));
-      
-      if (intersection.length > 0) {
-        console.warn(`⚠️ WARNING: Overlapping proxies between ${client1Name} and ${client2Name}: ${intersection.map(p => p.split('@')[1]).join(', ')}`);
-      }
-    }
-  }
-}
-
-// ====== API ДЛЯ TELEGRAM БОТА ======
-
-// Получить всех клиентов
-app.get('/api/clients', (req, res) => {
-  const clients = {};
-  Object.keys(clientsConfig).forEach(clientName => {
-    clients[clientName] = {
-      totalProxies: clientProxies[clientName]?.length || 0,
-      currentProxy: getCurrentProxy(clientName)?.split('@')[1],
-      rotationCount: rotationCounters[clientName] || 0,
-      activeTunnels: activeTunnels[clientName]?.size || 0,
-      proxies: clientsConfig[clientName].proxies.map(p => p.split('@')[1])
-    };
-  });
-  
-  res.json({
-    success: true,
-    clients,
-    totalClients: Object.keys(clients).length
-  });
-});
-
-// Добавить клиента
-app.post('/api/add-client', async (req, res) => {
-  const { clientName, password, proxies } = req.body;
-  
-  if (!clientName || !password) {
-    return res.status(400).json({ error: 'clientName and password are required' });
-  }
-  
-  if (clientsConfig[clientName]) {
-    return res.status(409).json({ error: 'Client already exists' });
-  }
-  
-  clientsConfig[clientName] = {
-    password,
-    proxies: proxies || []
-  };
-  
-  await saveConfig();
-  initializeClients();
-  
-  console.log(`➕ Added new client: ${clientName} with ${proxies?.length || 0} proxies`);
-  
-  res.json({
-    success: true,
-    message: `Client ${clientName} added successfully`,
-    client: {
-      name: clientName,
-      totalProxies: proxies?.length || 0
-    }
-  });
-});
-
-// ✅ ИСПРАВЛЕНО: Удалить клиента (изменен путь с /api/remove-client на /api/delete-client)
-app.delete('/api/delete-client/:clientName', async (req, res) => {
-  const { clientName } = req.params;
-  
-  if (!clientsConfig[clientName]) {
-    return res.status(404).json({ error: 'Client not found' });
-  }
-  
-  // Закрываем все активные туннели клиента
-  const killed = closeUserTunnels(clientName);
-  
-  delete clientsConfig[clientName];
-  await saveConfig();
-  initializeClients();
-  
-  console.log(`🗑 Deleted client: ${clientName}, closed ${killed} tunnels`);
-  
-  res.json({
-    success: true,
-    message: `Client ${clientName} deleted successfully`,
-    closedTunnels: killed
-  });
-});
-
-// ✅ ДОБАВЛЕНО: Алиас для старого API (для совместимости)
-app.delete('/api/remove-client/:clientName', async (req, res) => {
-  const { clientName } = req.params;
-  
-  if (!clientsConfig[clientName]) {
-    return res.status(404).json({ error: 'Client not found' });
-  }
-  
-  const killed = closeUserTunnels(clientName);
-  
-  delete clientsConfig[clientName];
-  await saveConfig();
-  initializeClients();
-  
-  console.log(`➖ Removed client: ${clientName}, closed ${killed} tunnels`);
-  
-  res.json({
-    success: true,
-    message: `Client ${clientName} removed successfully`,
-    closedTunnels: killed
-  });
-});
-
-// Добавить прокси к клиенту
-app.post('/api/add-proxy', async (req, res) => {
-  const { clientName, proxy } = req.body;
-  
-  if (!clientName || !proxy) {
-    return res.status(400).json({ error: 'clientName and proxy are required' });
-  }
-  
-  if (!clientsConfig[clientName]) {
-    return res.status(404).json({ error: 'Client not found' });
-  }
-  
-  // Проверяем формат прокси
-  if (!proxy.startsWith('http://') || !proxy.includes('@')) {
-    return res.status(400).json({ error: 'Invalid proxy format. Use: http://user:pass@host:port' });
-  }
-  
-  if (clientsConfig[clientName].proxies.includes(proxy)) {
-    return res.status(409).json({ error: 'Proxy already exists for this client' });
-  }
-  
-  clientsConfig[clientName].proxies.push(proxy);
-  await saveConfig();
-  initializeClients();
-  
-  console.log(`➕ Added proxy to ${clientName}: ${proxy.split('@')[1]}`);
-  
-  res.json({
-    success: true,
-    message: `Proxy added to ${clientName}`,
-    proxy: proxy.split('@')[1],
-    totalProxies: clientsConfig[clientName].proxies.length
-  });
-});
-
-// Удалить прокси у клиента
-app.delete('/api/remove-proxy', async (req, res) => {
-  const { clientName, proxy } = req.body;
-  
-  if (!clientName || !proxy) {
-    return res.status(400).json({ error: 'clientName and proxy are required' });
-  }
-  
-  if (!clientsConfig[clientName]) {
-    return res.status(404).json({ error: 'Client not found' });
-  }
-  
-  // Ищем прокси по полному URL или по host:port
-  let proxyToRemove = null;
-  if (proxy.startsWith('http://')) {
-    proxyToRemove = proxy;
-  } else {
-    proxyToRemove = clientsConfig[clientName].proxies.find(p => p.includes(proxy));
-  }
-  
-  if (!proxyToRemove) {
-    return res.status(404).json({ error: 'Proxy not found for this client' });
-  }
-  
-  clientsConfig[clientName].proxies = clientsConfig[clientName].proxies.filter(p => p !== proxyToRemove);
-  await saveConfig();
-  initializeClients();
-  
-  console.log(`➖ Removed proxy from ${clientName}: ${proxyToRemove.split('@')[1]}`);
-  
-  res.json({
-    success: true,
-    message: `Proxy removed from ${clientName}`,
-    proxy: proxyToRemove.split('@')[1],
-    totalProxies: clientsConfig[clientName].proxies.length
-  });
-});
-
-// Ротация прокси для клиента (для Telegram бота)
-app.post('/api/rotate-client', async (req, res) => {
-  const { clientName } = req.body;
-  
-  if (!clientName) {
-    return res.status(400).json({ error: 'clientName is required' });
-  }
-  
-  if (!clientsConfig[clientName]) {
-    return res.status(404).json({ error: 'Client not found' });
-  }
-  
-  const oldProxy = getCurrentProxy(clientName);
-  const newProxy = await rotateProxy(clientName);
-  const killed = closeUserTunnels(clientName);
-  
-  console.log(`[API] Telegram rotate client=${clientName} killed=${killed} ${oldProxy?.split('@')[1]} -> ${newProxy?.split('@')[1]}`);
-  
-  res.json({
-    success: true,
-    message: `Proxy rotated for ${clientName}`,
-    oldProxy: oldProxy?.split('@')[1],
-    newProxy: newProxy?.split('@')[1],
-    rotationCount: rotationCounters[clientName],
-    closedTunnels: killed
-  });
-});
-
-// ====== ОРИГИНАЛЬНЫЕ ФУНКЦИИ ПРОКСИ СЕРВЕРА ======
-
-function closeUserTunnels(username) {
-  const set = activeTunnels[username];
-  if (!set) return 0;
-  let n = 0;
-  for (const pair of set) {
-    try { pair.clientSocket.destroy(); } catch {}
-    try { pair.proxySocket.destroy(); } catch {}
-    n++;
-  }
-  set.clear();
-  return n;
-}
-
-function parseProxyUrl(proxyUrl) {
+// ====== ФУНКЦИИ РАБОТЫ С ПРОКСИ СЕРВЕРОМ ======
+async function testRailwayConnection() {
   try {
-    const u = new URL(proxyUrl);
-    return { host: u.hostname, port: +u.port, username: u.username, password: u.password };
-  } catch { return null; }
-}
-
-function getCurrentProxy(username) {
-  const list = currentProxies[username];
-  if (!list) return null;
-  for (let i = 0; i < list.length; i++) {
-    if (!blockedProxies.has(list[i])) return list[i];
-  }
-  return list[0] || null;
-}
-
-async function rotateProxy(username) {
-  lastRotationTime.set(username, Date.now());
-
-  const list = currentProxies[username];
-  if (!list || list.length <= 1) return getCurrentProxy(username);
-
-  const oldProxy = list.shift();
-  list.push(oldProxy);
-  rotationCounters[username]++;
-
-  // Пропускаем заблокированные прокси
-  let attempts = 0;
-  while (blockedProxies.has(list[0]) && attempts < list.length) {
-    const blocked = list.shift();
-    list.push(blocked);
-    attempts++;
-  }
-
-  await new Promise(resolve => setTimeout(resolve, 500));
-
-  const newProxy = list[0];
-  console.log(`🔄 ROTATE ${username}: ${oldProxy.split('@')[1]} -> ${newProxy.split('@')[1]} (#${rotationCounters[username]}) [CONCURRENT]`);
-  return newProxy;
-}
-
-function authenticate(authHeader) {
-  if (!authHeader || !authHeader.startsWith('Basic ')) return null;
-  try {
-    const [u, p] = Buffer.from(authHeader.split(' ')[1], 'base64').toString().split(':');
-    return users[u] === p ? u : null;
-  } catch { return null; }
-}
-
-// ====== ОРИГИНАЛЬНЫЕ API ENDPOINTS ======
-const PUBLIC_HOST = (process.env.PUBLIC_HOST || 'yamabiko.proxy.rlwy.net:38659').toLowerCase();
-const EXTRA_HOSTS = (process.env.EXTRA_HOSTS || '')
-  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
-
-const SELF_HOSTNAMES = new Set([
-  PUBLIC_HOST.split(':')[0],
-  ...EXTRA_HOSTS.map(h => h.split(':')[0]),
-  ...(process.env.RAILWAY_STATIC_URL ? [String(process.env.RAILWAY_STATIC_URL).toLowerCase().split(':')[0]] : []),
-  ...(process.env.RAILWAY_PUBLIC_DOMAIN ? [String(process.env.RAILWAY_PUBLIC_DOMAIN).toLowerCase().split(':')[0]] : [])
-].filter(Boolean));
-
-function isSelfApiRequest(req) {
-  try {
-    if (req.url.startsWith('http://') || req.url.startsWith('https://')) {
-      const u = new URL(req.url);
-      if (SELF_HOSTNAMES.has(u.hostname.toLowerCase())) {
-        const p = u.pathname;
-        return p === '/' || p.startsWith('/status') || p.startsWith('/current') || p.startsWith('/rotate') ||
-               p.startsWith('/block') || p.startsWith('/unblock') || p.startsWith('/blocked') || p.startsWith('/myip') ||
-               p.startsWith('/api/');
-      }
-    }
-    const hostHeader = (req.headers.host || '').toLowerCase();
-    const onlyHost = hostHeader.split(':')[0];
-    if (SELF_HOSTNAMES.has(onlyHost)) {
-      const p = (req.url || '').split('?')[0];
-      return p === '/' || p.startsWith('/status') || p.startsWith('/current') || p.startsWith('/rotate') ||
-             p.startsWith('/block') || p.startsWith('/unblock') || p.startsWith('/blocked') || p.startsWith('/myip') ||
-             p.startsWith('/api/');
-    }
-  } catch {}
-  return false;
-}
-
-app.use((req, res, next) => { res.setHeader('Connection', 'close'); next(); });
-
-const upstreamAgent = new http.Agent({
-  keepAlive: true,
-  maxSockets: 256,
-  maxFreeSockets: 32,
-  timeout: 60000,
-  keepAliveMsecs: 10000,
-});
-
-// Оригинальные API endpoints
-app.post('/rotate', async (req, res) => {
-  const user = authenticate(req.headers['authorization']);
-  if (!user) return res.status(401).json({ error: 'Unauthorized' });
-
-  const oldProxy = getCurrentProxy(user);
-  const newProxy = await rotateProxy(user);
-  const killed = closeUserTunnels(user);
-
-  console.log(`[API] POST /rotate user=${user} killed=${killed} ${oldProxy?.split('@')[1]} -> ${newProxy?.split('@')[1]} [CONCURRENT]`);
-
-  res.json({
-    success: true,
-    message: 'Proxy rotated (concurrent mode)',
-    oldProxy: oldProxy?.split('@')[1],
-    newProxy: newProxy?.split('@')[1],
-    rotationCount: rotationCounters[user],
-    totalProxies: currentProxies[user].length,
-    blockedProxies: blockedProxies.size,
-    closedTunnels: killed,
-    concurrentMode: true,
-    rotationTime: Date.now() - (lastRotationTime.get(user) || Date.now())
-  });
-});
-
-app.get('/current', (req, res) => {
-  const user = authenticate(req.headers['authorization']);
-  if (!user) return res.status(401).json({ error: 'Unauthorized' });
-
-  const cur = getCurrentProxy(user);
-  console.log(`[API] GET /current user=${user} -> ${cur?.split('@')[1]}`);
-
-  res.json({
-    user,
-    currentProxy: cur?.split('@')[1],
-    fullProxy: cur,
-    totalProxies: currentProxies[user].length,
-    rotationCount: rotationCounters[user],
-    activeTunnels: activeTunnels[user].size,
-    blockedProxies: blockedProxies.size,
-    concurrentMode: true,
-    lastRotation: lastRotationTime.get(user) || 0
-  });
-});
-
-app.get('/myip', async (req, res) => {
-  const user = authenticate(req.headers['authorization']);
-  if (!user) return res.status(401).json({ error: 'Unauthorized' });
-
-  const proxyUrl = getCurrentProxy(user);
-  if (!proxyUrl) return res.status(502).json({ error: 'No proxy available' });
-
-  const up = parseProxyUrl(proxyUrl);
-  if (!up) return res.status(502).json({ error: 'Invalid proxy config' });
-
-  console.log(`[API] GET /myip user=${user} via ${up.host}:${up.port}`);
-
-  const ipServices = [
-    { url: 'http://api.ipify.org?format=json', type: 'json' },
-    { url: 'http://ifconfig.me/ip', type: 'text' },
-    { url: 'http://icanhazip.com', type: 'text' },
-    { url: 'http://ident.me', type: 'text' }
-  ];
-
-  function fetchViaProxy(service) {
-    return new Promise((resolve, reject) => {
-      const serviceUrlObj = new URL(service.url);
-      const proxyOptions = {
-        hostname: up.host,
-        port: up.port,
-        path: service.url,
-        method: 'GET',
-        headers: {
-          'Proxy-Authorization': `Basic ${Buffer.from(`${up.username}:${up.password}`).toString('base64')}`,
-          'Host': serviceUrlObj.hostname,
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        },
-        agent: upstreamAgent,
-        timeout: 20000
-      };
-
-      const proxyReq = http.request(proxyOptions, (proxyRes) => {
-        let data = '';
-        proxyRes.on('data', chunk => data += chunk);
-        proxyRes.on('end', () => {
-          if (proxyRes.statusCode >= 200 && proxyRes.statusCode < 300) {
-            let ip = null;
-            if (service.type === 'json') {
-              try { ip = JSON.parse(data).ip; } catch {}
-            }
-            if (!ip) {
-              ip = data.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/)?.[0] ||
-                   data.match(/(?:[0-9a-fA-F]{1,4}:){1,7}[0-9a-fA-F]{1,4}/)?.[0] ||
-                   data.trim();
-            }
-            if (ip && /^[\d.:]+$/.test(ip)) return resolve({ ip, service: service.url });
-            return reject(new Error('Bad IP parse'));
-          } else {
-            return reject(new Error(`HTTP ${proxyRes.statusCode}`));
-          }
-        });
-      });
-
-      proxyReq.on('socket', s => { try { s.setNoDelay(true); s.setKeepAlive(true, 10000); } catch {} });
-      proxyReq.on('timeout', () => proxyReq.destroy(new Error('Timeout')));
-      proxyReq.on('error', reject);
-      proxyReq.end();
+    const fetch = (await import('node-fetch')).default;
+    const response = await fetch(`${PROXY_SERVER_URL}/status`, {
+      method: 'GET',
+      timeout: 10000
     });
+    
+    if (response.ok) {
+      console.log('✅ Proxy server connection test successful');
+      return true;
+    } else {
+      console.error('❌ Proxy server returned:', response.status, response.statusText);
+      return false;
+    }
+  } catch (error) {
+    console.error('❌ Failed to connect to proxy server:', error.message);
+    return false;
   }
+}
 
+// ✅ ИСПРАВЛЕНО: Полностью переписана функция синхронизации с правильными API endpoints
+async function updateProxyServer() {
   try {
-    const result = await Promise.any(ipServices.map(fetchViaProxy));
-    console.log(`[API] /myip result for ${user}: ${result.ip} via ${result.service}`);
-    return res.json({ ip: result.ip, proxy: `${up.host}:${up.port}`, service: result.service });
-  } catch (err) {
-    console.error(`[API] /myip all services failed for ${user}: ${err?.message}`);
-    return res.status(502).json({ error: 'Failed to get IP from all services', lastError: err?.message });
+    const fetch = (await import('node-fetch')).default;
+    
+    console.log('🔄 Начинаем синхронизацию с прокси сервером...');
+    console.log(`🌐 Прокси сервер URL: ${PROXY_SERVER_URL}`);
+    console.log(`🔐 API Auth: Basic ${API_AUTH.substring(0, 10)}...`);
+    
+    // Получаем текущих клиентов с прокси сервера
+    console.log('📥 Получаем список клиентов с прокси сервера...');
+    const currentResponse = await fetch(`${PROXY_SERVER_URL}/api/clients`, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      timeout: 15000
+    });
+    
+    if (!currentResponse.ok) {
+      const errorText = await currentResponse.text();
+      console.error(`❌ Failed to get current clients: ${currentResponse.status} ${errorText}`);
+      throw new Error(`Failed to get current clients: ${currentResponse.status}`);
+    }
+    
+    const currentData = await currentResponse.json();
+    const currentClients = Object.keys(currentData.clients || {});
+    const localClients = Object.keys(clientsConfig);
+    
+    console.log(`📊 Синхронизация: Local=${localClients.length}, Remote=${currentClients.length}`);
+    console.log(`📋 Local clients: [${localClients.join(', ')}]`);
+    console.log(`📋 Remote clients: [${currentClients.join(', ')}]`);
+    
+    // Удаляем клиентов, которых нет в локальной конфигурации
+    for (const clientName of currentClients) {
+      if (!localClients.includes(clientName)) {
+        console.log(`🗑 Удаляем клиента с прокси сервера: ${clientName}`);
+        const deleteResponse = await fetch(`${PROXY_SERVER_URL}/api/delete-client/${clientName}`, {
+          method: 'DELETE',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          timeout: 15000
+        });
+        
+        if (!deleteResponse.ok) {
+          const errorText = await deleteResponse.text();
+          console.error(`❌ Failed to delete client ${clientName}: ${deleteResponse.status} ${errorText}`);
+        } else {
+          console.log(`✅ Клиент ${clientName} успешно удален с прокси сервера`);
+        }
+      }
+    }
+    
+    // Добавляем/обновляем клиентов из локальной конфигурации
+    for (const [clientName, config] of Object.entries(clientsConfig)) {
+      console.log(`🔍 Обрабатываем клиента: ${clientName}`);
+      console.log(`   Пароль: ${config.password}`);
+      console.log(`   Прокси: ${config.proxies.length} шт.`);
+      
+      if (config.proxies.length > 0) {
+        console.log(`   Первый прокси: ${config.proxies[0]}`);
+        console.log(`   Последний прокси: ${config.proxies[config.proxies.length - 1]}`);
+      }
+      
+      if (!currentClients.includes(clientName)) {
+        console.log(`➕ Добавляем клиента на прокси сервер: ${clientName}`);
+        
+        // ✅ ИСПРАВЛЕНО: Правильная структура данных для API
+        const requestBody = {
+          clientName: clientName,
+          password: config.password,
+          proxies: config.proxies
+        };
+        
+        console.log(`📤 Отправляем данные на ${PROXY_SERVER_URL}/api/add-client:`);
+        console.log(JSON.stringify(requestBody, null, 2));
+        
+        const addResponse = await fetch(`${PROXY_SERVER_URL}/api/add-client`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(requestBody),
+          timeout: 15000
+        });
+        
+        if (addResponse.ok) {
+          const responseData = await addResponse.json();
+          console.log(`✅ Клиент ${clientName} успешно добавлен на прокси сервер`);
+          console.log(`📥 Ответ сервера:`, JSON.stringify(responseData, null, 2));
+        } else {
+          const errorText = await addResponse.text();
+          console.error(`❌ Failed to add client ${clientName}: ${addResponse.status} ${errorText}`);
+          return { success: false, error: `Failed to add client ${clientName}: ${addResponse.status} ${errorText}` };
+        }
+      } else {
+        console.log(`✅ Клиент ${clientName} уже существует на прокси сервере`);
+      }
+    }
+    
+    console.log('✅ Синхронизация с прокси сервером завершена успешно');
+    return { success: true };
+    
+  } catch (error) {
+    console.error('⚠️ Ошибка синхронизации с прокси сервером:', error.message);
+    console.error('📋 Stack trace:', error.stack);
+    return { success: false, error: error.message };
   }
-});
+}
 
-app.get('/status', (req, res) => {
-  let totalOverlapping = 0;
-  const overlappingList = [];
-  const clientNames = Object.keys(clientsConfig);
+// ====== ФУНКЦИИ АВТОРИЗАЦИИ С ОТЛАДКОЙ ======
+function isAuthorized(userId) {
+  const authorized = ADMIN_IDS.includes(userId);
+  console.log(`🔍 Проверка авторизации: userId=${userId}, authorized=${authorized}`);
+  return authorized;
+}
+
+function isSuperAdmin(userId) {
+  const isSuperAdm = userId === SUPER_ADMIN_ID;
+  console.log(`👑 Проверка супер-админа: userId=${userId}, SUPER_ADMIN_ID=${SUPER_ADMIN_ID}, result=${isSuperAdm}`);
+  return isSuperAdm;
+}
+
+function isManager(userId) {
+  const isManagerResult = MANAGER_IDS.includes(userId);
+  console.log(`👥 Проверка менеджера: userId=${userId}, MANAGER_IDS=[${MANAGER_IDS.join(', ')}], result=${isManagerResult}`);
+  return isManagerResult;
+}
+
+function getUserRole(userId) {
+  if (isSuperAdmin(userId)) return 'Супер-админ';
+  if (isManager(userId)) return 'Менеджер';
+  return 'Не авторизован';
+}
+
+// ====== ФУНКЦИИ ПАРСИНГА ПРОКСИ ======
+function parseProxyList(proxyText) {
+  const lines = proxyText.split('\n').map(line => line.trim()).filter(line => line.length > 0);
+  const proxies = [];
+  const errors = [];
   
-  for (let i = 0; i < clientNames.length; i++) {
-    for (let j = i + 1; j < clientNames.length; j++) {
-      const client1Name = clientNames[i];
-      const client2Name = clientNames[j];
-      const client1Set = allProxySets[client1Name];
-      const client2Set = allProxySets[client2Name];
-      const intersection = clientProxies[client1Name].filter(p => client2Set.has(p));
-      totalOverlapping += intersection.length;
-      overlappingList.push(...intersection.map(p => p.split('@')[1]));
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const parts = line.split(':');
+    
+    if (parts.length === 4) {
+      const [host, port, user, pass] = parts;
+      // ✅ ИСПРАВЛЕНО: Правильный формат для прокси сервера
+      const proxyUrl = `http://${user}:${pass}@${host}:${port}`;
+      proxies.push(proxyUrl);
+      console.log(`✅ Парсинг прокси ${i + 1}: ${host}:${port} -> ${proxyUrl}`);
+    } else {
+      const error = `Строка ${i + 1}: "${line}" - неверный формат (нужно host:port:user:pass)`;
+      errors.push(error);
+      console.log(`❌ ${error}`);
     }
   }
+  
+  console.log(`📊 Парсинг завершен: ${proxies.length} успешно, ${errors.length} ошибок`);
+  return { proxies, errors };
+}
 
-  const clients = {};
-  Object.keys(clientsConfig).forEach(clientName => {
-    clients[clientName] = {
-      totalProxies: clientProxies[clientName]?.length || 0,
-      currentProxy: getCurrentProxy(clientName)?.split('@')[1],
-      rotationCount: rotationCounters[clientName] || 0,
-      activeTunnels: activeTunnels[clientName]?.size || 0,
-      lastRotation: lastRotationTime.get(clientName) || 0
+// ====== ОБРАБОТЧИК ВСЕХ СООБЩЕНИЙ (ДЛЯ ОТЛАДКИ) ======
+bot.on('message', (msg) => {
+  const userId = msg.from.id;
+  const username = msg.from.username || 'без username';
+  const firstName = msg.from.first_name || 'без имени';
+  
+  console.log(`\n📨 ПОЛУЧЕНО СООБЩЕНИЕ:`);
+  console.log(`   От: ${firstName} (@${username})`);
+  console.log(`   ID: ${userId}`);
+  console.log(`   Текст: "${msg.text ? msg.text.substring(0, 100) : 'не текст'}${msg.text && msg.text.length > 100 ? '...' : ''}"`);
+  console.log(`   Авторизован: ${isAuthorized(userId)}`);
+  console.log(`   Роль: ${getUserRole(userId)}`);
+});
+
+// ====== КОМАНДЫ БОТА ======
+bot.onText(/\/start/, async (msg) => {
+  const userId = msg.from.id;
+  const role = getUserRole(userId);
+  
+  console.log(`🚀 Команда /start от userId=${userId}, роль=${role}`);
+  
+  if (!isAuthorized(userId)) {
+    const debugMessage = `
+❌ **У вас нет доступа к этому боту.**
+
+🔍 **Отладочная информация:**
+• Ваш ID: \`${userId}\`
+• Настроенные админы: \`${ADMIN_IDS.join(', ')}\`
+• ADMIN_IDS строка: \`"${ADMIN_IDS_STRING}"\`
+• Супер-админ: \`${SUPER_ADMIN_ID || 'НЕ УСТАНОВЛЕН'}\`
+
+📝 **Для получения доступа:**
+1. Добавьте ваш ID (${userId}) в переменную ADMIN_IDS
+2. Формат: \`${userId},другие_id\`
+3. Перезапустите бота
+    `;
+    return bot.sendMessage(msg.chat.id, debugMessage, { parse_mode: 'Markdown' });
+  }
+  
+  const welcomeMessage = `
+🤖 **Добро пожаловать в Proxy Manager Bot!**
+
+👤 Ваша роль: **${role}**
+🆔 Ваш ID: \`${userId}\`
+
+📋 **Доступные команды:**
+/clients - Список всех клиентов
+/addclient - Добавить клиента (быстро)
+/addclientbulk - Добавить клиента со списком прокси
+/deleteclient - Удалить клиента
+/addproxy - Добавить прокси к клиенту
+/status - Статус системы
+/debug - Отладочная информация
+/sync - Принудительная синхронизация с прокси сервером
+
+🔧 **Админские команды:**
+${isSuperAdmin(userId) ? '/manageadmins - Управление администраторами' : ''}
+/restart - Перезапуск бота (только супер-админ)
+  `;
+  
+  bot.sendMessage(msg.chat.id, welcomeMessage, { parse_mode: 'Markdown' });
+});
+
+bot.onText(/\/debug/, async (msg) => {
+  const userId = msg.from.id;
+  
+  const debugInfo = `
+🔍 **Отладочная информация:**
+
+👤 **Ваши данные:**
+• ID: \`${userId}\`
+• Username: @${msg.from.username || 'нет'}
+• Имя: ${msg.from.first_name || 'нет'}
+
+🔐 **Настройки авторизации:**
+• ADMIN_IDS строка: \`"${ADMIN_IDS_STRING}"\`
+• ADMIN_IDS массив: \`[${ADMIN_IDS.join(', ')}]\`
+• Супер-админ: \`${SUPER_ADMIN_ID || 'НЕ УСТАНОВЛЕН'}\`
+• Менеджеры: \`[${MANAGER_IDS.join(', ')}]\`
+
+✅ **Статус доступа:**
+• Авторизован: ${isAuthorized(userId) ? '✅ ДА' : '❌ НЕТ'}
+• Супер-админ: ${isSuperAdmin(userId) ? '✅ ДА' : '❌ НЕТ'}
+• Менеджер: ${isManager(userId) ? '✅ ДА' : '❌ НЕТ'}
+• Роль: ${getUserRole(userId)}
+
+🌐 **Настройки сервера:**
+• Прокси сервер: \`${PROXY_SERVER_URL}\`
+• Порт бота: \`${PORT}\`
+• BOT_TOKEN: ${BOT_TOKEN ? '✅ УСТАНОВЛЕН' : '❌ НЕ УСТАНОВЛЕН'}
+  `;
+  
+  bot.sendMessage(msg.chat.id, debugInfo, { parse_mode: 'Markdown' });
+});
+
+bot.onText(/\/clients/, async (msg) => {
+  const userId = msg.from.id;
+  if (!isAuthorized(userId)) {
+    return bot.sendMessage(msg.chat.id, `❌ Нет доступа. Ваш ID: ${userId}. Используйте /debug для диагностики.`);
+  }
+  
+  if (Object.keys(clientsConfig).length === 0) {
+    return bot.sendMessage(msg.chat.id, '📝 Клиенты не найдены. Используйте /addclient для добавления.');
+  }
+  
+  let message = '👥 **Список клиентов:**\n\n';
+  
+  for (const [clientName, config] of Object.entries(clientsConfig)) {
+    message += `🔹 **${clientName}**\n`;
+    message += `   └ Пароль: \`${config.password}\`\n`;
+    message += `   └ Прокси: ${config.proxies.length} шт.\n\n`;
+  }
+  
+  bot.sendMessage(msg.chat.id, message, { parse_mode: 'Markdown' });
+});
+
+// ✅ КОМАНДА: Быстрое добавление клиента
+bot.onText(/\/addclient/, async (msg) => {
+  const userId = msg.from.id;
+  if (!isAuthorized(userId)) {
+    return bot.sendMessage(msg.chat.id, `❌ Нет доступа. Ваш ID: ${userId}. Используйте /debug для диагностики.`);
+  }
+  
+  console.log(`➕ Команда /addclient от userId=${userId}`);
+  
+  const instructionMessage = `
+➕ **Добавление нового клиента**
+
+📋 **Два способа добавления:**
+
+**1️⃣ Быстрое добавление (без прокси):**
+\`имя_клиента пароль\`
+Пример: \`client1 mypassword123\`
+
+**2️⃣ Полное добавление (с прокси):**
+Используйте команду /addclientbulk
+
+💡 **Выберите способ и введите данные:**
+  `;
+  
+  bot.sendMessage(msg.chat.id, instructionMessage, { parse_mode: 'Markdown' });
+  
+  bot.once('message', async (response) => {
+    if (response.from.id !== userId) return;
+    
+    console.log(`📝 Получен ответ для добавления клиента: "${response.text}"`);
+    
+    const parts = response.text.trim().split(' ');
+    if (parts.length !== 2) {
+      return bot.sendMessage(msg.chat.id, '❌ Неверный формат. Используйте: `имя_клиента пароль`\n\nДля добавления с прокси используйте /addclientbulk', { parse_mode: 'Markdown' });
+    }
+    
+    const [clientName, password] = parts;
+    
+    if (clientsConfig[clientName]) {
+      return bot.sendMessage(msg.chat.id, `❌ Клиент **${clientName}** уже существует.`, { parse_mode: 'Markdown' });
+    }
+    
+    clientsConfig[clientName] = {
+      password,
+      proxies: []
     };
-  });
-
-  res.json({
-    status: 'running',
-    platform: 'Railway TCP Proxy - Enhanced with Telegram Bot Management',
-    port: PORT,
-    publicHost: PUBLIC_HOST,
-    selfHostnames: [...SELF_HOSTNAMES],
-    totalBlockedProxies: blockedProxies.size,
-    concurrentMode: true,
-    telegramBotEnabled: true,
-    proxyIsolation: {
-      overlappingProxies: totalOverlapping,
-      overlappingList: [...new Set(overlappingList)],
-      fullyIsolated: totalOverlapping === 0
-    },
-    clients,
-    timestamp: new Date().toISOString()
+    
+    await saveConfig();
+    console.log(`✅ Клиент ${clientName} добавлен локально`);
+    
+    // Обновляем прокси сервер
+    const updateResult = await updateProxyServer();
+    
+    if (updateResult.success) {
+      bot.sendMessage(msg.chat.id, `✅ Клиент **${clientName}** успешно добавлен!\n\n🔑 Пароль: \`${password}\`\n📊 Прокси: 0 шт.\n\nИспользуйте /addproxy для добавления прокси или /addclientbulk для массового добавления.`, { parse_mode: 'Markdown' });
+    } else {
+      bot.sendMessage(msg.chat.id, `⚠️ Клиент добавлен локально, но не удалось обновить прокси сервер.\n\nОшибка: ${updateResult.error || 'Unknown error'}`, { parse_mode: 'Markdown' });
+    }
   });
 });
 
-app.get('/', (req, res) => {
-  let totalOverlapping = 0;
-  const clientNames = Object.keys(clientsConfig);
+// ✅ КОМАНДА: Добавление клиента со списком прокси
+bot.onText(/\/addclientbulk/, async (msg) => {
+  const userId = msg.from.id;
+  if (!isAuthorized(userId)) {
+    return bot.sendMessage(msg.chat.id, `❌ Нет доступа. Ваш ID: ${userId}. Используйте /debug для диагностики.`);
+  }
   
-  for (let i = 0; i < clientNames.length; i++) {
-    for (let j = i + 1; j < clientNames.length; j++) {
-      const client1Name = clientNames[i];
-      const client2Name = clientNames[j];
-      const client1Set = allProxySets[client1Name];
-      const client2Set = allProxySets[client2Name];
-      const intersection = clientProxies[client1Name].filter(p => client2Set.has(p));
-      totalOverlapping += intersection.length;
+  console.log(`📦 Команда /addclientbulk от userId=${userId}`);
+  
+  const instructionMessage = `
+📦 **Добавление клиента со списком прокси**
+
+📋 **Формат:**
+Первая строка: \`имя_клиента пароль\`
+Остальные строки: список прокси в формате \`host:port:user:pass\`
+
+📝 **Пример:**
+\`\`\`
+client1 mypassword123
+31.129.21.214:9379:gNzocE:fnKaHc
+45.91.65.201:9524:gNzocE:fnKaHc
+45.91.65.235:9071:gNzocE:fnKaHc
+\`\`\`
+
+💡 **Введите данные в указанном формате:**
+  `;
+  
+  bot.sendMessage(msg.chat.id, instructionMessage, { parse_mode: 'Markdown' });
+  
+  bot.once('message', async (response) => {
+    if (response.from.id !== userId) return;
+    
+    console.log(`📦 Получен ответ для массового добавления клиента`);
+    console.log(`📝 Длина сообщения: ${response.text.length} символов`);
+    
+    const lines = response.text.trim().split('\n').map(line => line.trim()).filter(line => line.length > 0);
+    console.log(`📋 Количество строк: ${lines.length}`);
+    
+    if (lines.length < 1) {
+      return bot.sendMessage(msg.chat.id, '❌ Пустое сообщение. Введите данные клиента и прокси.', { parse_mode: 'Markdown' });
+    }
+    
+    // Парсим первую строку как данные клиента
+    const clientParts = lines[0].split(' ');
+    console.log(`👤 Первая строка: "${lines[0]}"`);
+    console.log(`🔍 Части клиента: [${clientParts.join(', ')}]`);
+    
+    if (clientParts.length !== 2) {
+      return bot.sendMessage(msg.chat.id, '❌ Неверный формат первой строки. Используйте: `имя_клиента пароль`', { parse_mode: 'Markdown' });
+    }
+    
+    const [clientName, password] = clientParts;
+    console.log(`👤 Клиент: ${clientName}, Пароль: ${password}`);
+    
+    if (clientsConfig[clientName]) {
+      return bot.sendMessage(msg.chat.id, `❌ Клиент **${clientName}** уже существует.`, { parse_mode: 'Markdown' });
+    }
+    
+    // Парсим остальные строки как прокси
+    const proxyLines = lines.slice(1);
+    console.log(`🌐 Строк с прокси: ${proxyLines.length}`);
+    
+    let proxies = [];
+    let errors = [];
+    
+    if (proxyLines.length > 0) {
+      const parseResult = parseProxyList(proxyLines.join('\n'));
+      proxies = parseResult.proxies;
+      errors = parseResult.errors;
+    }
+    
+    // Создаем клиента
+    clientsConfig[clientName] = {
+      password,
+      proxies
+    };
+    
+    await saveConfig();
+    console.log(`✅ Клиент ${clientName} добавлен локально с ${proxies.length} прокси`);
+    
+    // Обновляем прокси сервер
+    const updateResult = await updateProxyServer();
+    
+    let resultMessage = `✅ Клиент **${clientName}** успешно добавлен!\n\n`;
+    resultMessage += `🔑 Пароль: \`${password}\`\n`;
+    resultMessage += `📊 Прокси: ${proxies.length} шт.\n`;
+    
+    if (errors.length > 0) {
+      resultMessage += `\n⚠️ **Ошибки в прокси:**\n`;
+      errors.slice(0, 5).forEach(error => {
+        resultMessage += `• ${error}\n`;
+      });
+      if (errors.length > 5) {
+        resultMessage += `• ... и еще ${errors.length - 5} ошибок\n`;
+      }
+    }
+    
+    if (!updateResult.success) {
+      resultMessage += `\n⚠️ Клиент добавлен локально, но не удалось обновить прокси сервер.\nОшибка: ${updateResult.error || 'Unknown error'}`;
+    }
+    
+    bot.sendMessage(msg.chat.id, resultMessage, { parse_mode: 'Markdown' });
+  });
+});
+
+// ✅ КОМАНДА: Принудительная синхронизация
+bot.onText(/\/sync/, async (msg) => {
+  const userId = msg.from.id;
+  if (!isAuthorized(userId)) {
+    return bot.sendMessage(msg.chat.id, `❌ Нет доступа. Ваш ID: ${userId}. Используйте /debug для диагностики.`);
+  }
+  
+  console.log(`🔄 Команда /sync от userId=${userId}`);
+  
+  bot.sendMessage(msg.chat.id, '🔄 Начинаем принудительную синхронизацию с прокси сервером...', { parse_mode: 'Markdown' });
+  
+  const updateResult = await updateProxyServer();
+  
+  if (updateResult.success) {
+    bot.sendMessage(msg.chat.id, '✅ Синхронизация завершена успешно!', { parse_mode: 'Markdown' });
+  } else {
+    bot.sendMessage(msg.chat.id, `❌ Ошибка синхронизации:\n\n\`${updateResult.error || 'Unknown error'}\``, { parse_mode: 'Markdown' });
+  }
+});
+
+bot.onText(/\/status/, async (msg) => {
+  const userId = msg.from.id;
+  if (!isAuthorized(userId)) {
+    return bot.sendMessage(msg.chat.id, `❌ Нет доступа. Ваш ID: ${userId}. Используйте /debug для диагностики.`);
+  }
+  
+  const totalClients = Object.keys(clientsConfig).length;
+  const totalProxies = Object.values(clientsConfig).reduce((sum, config) => sum + config.proxies.length, 0);
+  
+  let message = `📊 **Статус системы**\n\n`;
+  message += `👥 Всего клиентов: ${totalClients}\n`;
+  message += `🌐 Всего прокси: ${totalProxies}\n`;
+  message += `🔗 Прокси сервер: ${PROXY_SERVER_URL}\n\n`;
+  
+  if (totalClients > 0) {
+    message += `📋 **Детали по клиентам:**\n`;
+    for (const [clientName, config] of Object.entries(clientsConfig)) {
+      message += `• **${clientName}**: ${config.proxies.length} прокси\n`;
     }
   }
+  
+  // Проверяем соединение с прокси сервером
+  const connectionOk = await testRailwayConnection();
+  message += `\n🔌 Соединение с прокси сервером: ${connectionOk ? '✅ OK' : '❌ Ошибка'}`;
+  
+  bot.sendMessage(msg.chat.id, message, { parse_mode: 'Markdown' });
+});
 
-  const authInfo = Object.keys(clientsConfig).length > 0 
-    ? Object.keys(clientsConfig).map(clientName => 
-        `${clientName}/${clientsConfig[clientName].password}`
-      ).join(' или ')
-    : 'No clients configured - use Telegram bot to add clients';
-
+// ====== HTTP СЕРВЕР ======
+app.get('/', (req, res) => {
   res.send(`
-    <h1>🚀 Railway Proxy Rotator - Enhanced with Telegram Bot</h1>
-    <pre>
-Public host: ${PUBLIC_HOST}
-Known hostnames: ${[...SELF_HOSTNAMES].join(', ')}
-
-Auth: Basic (${authInfo})
-
-⚡ Enhanced Features:
-- Telegram Bot Management API
-- Dynamic client/proxy management
-- File-based configuration persistence
-- Hot reload without restart
-- Concurrent rotation mode
-    </pre>
-    <h2>Original API:</h2>
-    <ul>
-      <li>GET /status - server status</li>
-      <li>GET /current (requires Basic) - current proxy</li>
-      <li>GET /myip (requires Basic) - get IP via proxy</li>
-      <li>POST /rotate (requires Basic) - rotate proxy</li>
-    </ul>
-    <h2>Telegram Bot API:</h2>
-    <ul>
-      <li>GET /api/clients - list all clients</li>
-      <li>POST /api/add-client - add new client</li>
-      <li>DELETE /api/delete-client/:name - delete client</li>
-      <li>DELETE /api/remove-client/:name - remove client (alias)</li>
-      <li>POST /api/add-proxy - add proxy to client</li>
-      <li>DELETE /api/remove-proxy - remove proxy from client</li>
-      <li>POST /api/rotate-client - rotate proxy for client</li>
-    </ul>
+    <h1>🤖 Telegram Proxy Manager Bot (CORRECTED)</h1>
+    <p>Bot is running with corrected API communication!</p>
+    <p>ADMIN_IDS: "${ADMIN_IDS_STRING}"</p>
+    <p>Parsed IDs: [${ADMIN_IDS.join(', ')}]</p>
+    <p>Super Admin: ${SUPER_ADMIN_ID || 'NOT SET'}</p>
+    <p>Managers: [${MANAGER_IDS.join(', ')}]</p>
     <p>Total clients: ${Object.keys(clientsConfig).length}</p>
-    <p>Overlapping proxies: ${totalOverlapping}</p>
-    <p>Blocked proxies: ${blockedProxies.size}</p>
+    <p>Total proxies: ${Object.values(clientsConfig).reduce((sum, config) => sum + config.proxies.length, 0)}</p>
+    <p>Proxy Server URL: ${PROXY_SERVER_URL}</p>
   `);
 });
 
-// ====== ПРОКСИ СЕРВЕР (ОРИГИНАЛЬНЫЙ КОД) ======
-const server = http.createServer();
-
-async function handleHttpProxy(req, res, user) {
-  const up = parseProxyUrl(getCurrentProxy(user));
-  if (!up) { res.writeHead(502); return res.end('502 No upstream'); }
-
-  console.log(`HTTP: ${user} -> ${up.host}:${up.port} -> ${req.url}`);
-
-  const options = {
-    hostname: up.host,
-    port: up.port,
-    path: req.url,
-    method: req.method,
-    headers: {
-      ...req.headers,
-      'Proxy-Authorization': `Basic ${Buffer.from(`${up.username}:${up.password}`).toString('base64')}`,
-    },
-    agent: upstreamAgent,
-    timeout: 45000
-  };
-  delete options.headers['proxy-authorization'];
-
-  const proxyReq = http.request(options, (proxyRes) => {
-    res.writeHead(proxyRes.statusCode, proxyRes.headers);
-    proxyRes.pipe(res);
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    clients: Object.keys(clientsConfig).length,
+    proxies: Object.values(clientsConfig).reduce((sum, config) => sum + config.proxies.length, 0),
+    adminIds: ADMIN_IDS,
+    superAdmin: SUPER_ADMIN_ID,
+    proxyServerUrl: PROXY_SERVER_URL
   });
-
-  proxyReq.on('socket', s => { try { s.setNoDelay(true); s.setKeepAlive(true, 10000); } catch {} });
-  proxyReq.on('timeout', () => proxyReq.destroy(new Error('Upstream timeout')));
-  proxyReq.on('error', (err) => {
-    console.error(`HTTP upstream error (${user}):`, err.message);
-    if (!res.headersSent) res.writeHead(502);
-    res.end('502 Bad Gateway - Proxy error');
-  });
-
-  req.pipe(proxyReq);
-}
-
-server.on('request', (req, res) => {
-  if (isSelfApiRequest(req)) {
-    const host = req.headers.host || '(no-host)';
-    console.log(`[SELF-API] ${req.method} ${req.url} Host:${host}`);
-    return app(req, res);
-  }
-
-  const user = authenticate(req.headers['proxy-authorization']);
-  if (!user) {
-    res.writeHead(407, { 'Proxy-Authenticate': 'Basic realm="Proxy"' });
-    return res.end('407 Proxy Authentication Required');
-  }
-
-  handleHttpProxy(req, res, user);
-});
-
-function tryConnect(req, clientSocket, user) {
-  const up = parseProxyUrl(getCurrentProxy(user));
-  if (!up) {
-    clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
-    return clientSocket.end();
-  }
-
-  console.log(`CONNECT: ${user} -> ${up.host}:${up.port} -> ${req.url}`);
-  const proxySocket = net.createConnection(up.port, up.host);
-
-  const pair = { clientSocket, proxySocket };
-  activeTunnels[user]?.add(pair);
-
-  const cleanup = () => activeTunnels[user]?.delete(pair);
-  proxySocket.on('close', cleanup);
-  clientSocket.on('close', cleanup);
-
-  try { proxySocket.setNoDelay(true); proxySocket.setKeepAlive(true, 10000); } catch {}
-  try { clientSocket.setNoDelay(true); clientSocket.setKeepAlive(true, 10000); } catch {}
-
-  proxySocket.setTimeout(45000, () => proxySocket.destroy(new Error('upstream timeout')));
-  clientSocket.setTimeout(45000, () => clientSocket.destroy(new Error('client timeout')));
-
-  proxySocket.on('connect', () => {
-    const auth = Buffer.from(`${up.username}:${up.password}`).toString('base64');
-    const connectReq =
-      `CONNECT ${req.url} HTTP/1.1\r\n` +
-      `Host: ${req.url}\r\n` +
-      `Proxy-Authorization: Basic ${auth}\r\n` +
-      `Proxy-Connection: keep-alive\r\n` +
-      `Connection: keep-alive\r\n\r\n`;
-    proxySocket.write(connectReq);
-  });
-
-  let established = false;
-  proxySocket.on('data', (data) => {
-    if (!established) {
-      const line = data.toString('utf8').split('\r\n')[0];
-      if (/^HTTP\/1\.[01]\s+200/i.test(line)) {
-        established = true;
-        try { clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n'); } catch {}
-        clientSocket.pipe(proxySocket);
-        proxySocket.pipe(clientSocket);
-      } else {
-        try { clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n'); } catch {}
-        clientSocket.end();
-        proxySocket.end();
-      }
-    }
-  });
-
-  proxySocket.on('error', (err) => {
-    console.error(`CONNECT upstream error (${user}):`, err.message);
-    try { clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n'); } catch {}
-    clientSocket.end();
-  });
-
-  clientSocket.on('error', () => { try { proxySocket.destroy(); } catch {} });
-}
-
-server.on('connect', (req, clientSocket) => {
-  const user = authenticate(req.headers['proxy-authorization']);
-  if (!user) {
-    clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Proxy"\r\n\r\n');
-    return clientSocket.end();
-  }
-  tryConnect(req, clientSocket, user);
 });
 
 // ====== ЗАПУСК ======
-const PORT = process.env.PORT || process.env.RAILWAY_PORT || 8080;
-
-async function startServer() {
+async function startBot() {
   await loadConfig();
-  initializeClients();
   
-  server.listen(PORT, '0.0.0.0', () => {
-    let totalOverlapping = 0;
-    const clientNames = Object.keys(clientsConfig);
-    
-    for (let i = 0; i < clientNames.length; i++) {
-      for (let j = i + 1; j < clientNames.length; j++) {
-        const client1Name = clientNames[i];
-        const client2Name = clientNames[j];
-        const client1Set = allProxySets[client1Name];
-        const client2Set = allProxySets[client2Name];
-        const intersection = clientProxies[client1Name].filter(p => client2Set.has(p));
-        totalOverlapping += intersection.length;
-      }
-    }
-
-    console.log(`🚀 Enhanced Proxy server running on port ${PORT}`);
-    console.log(`🌐 Public (TCP Proxy): ${PUBLIC_HOST}`);
-    console.log(`✅ API self hostnames: ${[...SELF_HOSTNAMES].join(', ')}`);
-    console.log(`🤖 Telegram Bot API enabled`);
-    
-    if (Object.keys(clientsConfig).length === 0) {
-      console.log(`📝 No clients configured - use Telegram bot to add clients`);
-    } else {
-      Object.keys(clientsConfig).forEach(clientName => {
-        console.log(`📊 ${clientName}: ${clientProxies[clientName]?.length || 0} proxies`);
-      });
-    }
-    
-    console.log(`⚡ Concurrent mode: NO rotation locks`);
-    console.log(`🔍 Overlapping proxies: ${totalOverlapping}`);
-    console.log(`💾 Configuration file: ${CONFIG_FILE}`);
-
-    if (totalOverlapping > 0) {
-      console.warn(`⚠️  WARNING: ${totalOverlapping} overlapping proxies may cause interference`);
-    } else {
-      console.log(`✅ Fully isolated proxy pools - safe for concurrent rotation`);
-    }
+  // Тестируем соединение с прокси сервером
+  await testRailwayConnection();
+  
+  // Синхронизируем с прокси сервером
+  await updateProxyServer();
+  
+  app.listen(PORT, () => {
+    console.log(`🌐 HTTP server running on port ${PORT}`);
   });
+  
+  console.log('🤖 Telegram Bot с системой ролей запущен (CORRECTED)!');
+  console.log(`🔑 Супер-админ: ${SUPER_ADMIN_ID}`);
+  console.log(`👥 Менеджеры: ${MANAGER_IDS.join(', ')}`);
+  console.log(`📁 Файл конфигурации: ${CONFIG_FILE}`);
+  console.log(`🌐 Прокси сервер URL: ${PROXY_SERVER_URL}`);
+  console.log(`🔐 API Auth: ${process.env.API_USERNAME || 'telegram_bot'}:${process.env.API_PASSWORD || 'bot_secret_2024'}`);
 }
 
-startServer().catch(console.error);
+// Обработка ошибок
+bot.on('error', (error) => {
+  console.error('❌ Telegram Bot Error:', error.message);
+});
+
+bot.on('polling_error', (error) => {
+  console.error('❌ Polling Error:', error.message);
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('❌ Uncaught Exception:', error.message);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+startBot().catch(console.error);

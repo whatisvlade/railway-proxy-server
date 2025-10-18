@@ -23,6 +23,9 @@ let clientsConfig = {};
 let ipBlacklist = new Set();
 let proxyRotation = {};
 
+// 🔄 Глобальные агенты для keep-alive соединений
+let globalProxyAgents = {};
+
 // Загрузка конфигурации
 function loadConfig() {
   try {
@@ -79,6 +82,19 @@ function saveBlacklist() {
     console.log('💾 Blacklist saved');
   } catch (error) {
     console.error('❌ Error saving blacklist:', error);
+  }
+}
+
+// 🔄 Очистка keep-alive соединений для клиента
+function clearKeepAliveConnections(username) {
+  if (globalProxyAgents[username]) {
+    try {
+      globalProxyAgents[username].destroy();
+      delete globalProxyAgents[username];
+      console.log(`🧹 Cleared keep-alive connections for ${username}`);
+    } catch (error) {
+      console.error(`❌ Error clearing connections for ${username}:`, error);
+    }
   }
 }
 
@@ -236,14 +252,19 @@ app.get('/health', (req, res) => {
   res.status(200).send('OK');
 });
 
-// Получить IP клиента
+// 🔄 УЛУЧШЕННЫЙ /myip endpoint с принудительным обновлением соединений
 app.get('/myip', (req, res) => {
   const clientIP = getClientIP(req);
+  
+  // Добавляем заголовки для предотвращения кеширования
   res.set({
     'Content-Type': 'text/plain',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive'
+    'Cache-Control': 'no-cache, no-store, must-revalidate',
+    'Pragma': 'no-cache',
+    'Expires': '0',
+    'Connection': 'close' // 🔄 Принудительно закрываем соединение
   });
+  
   res.send(clientIP);
 });
 
@@ -288,7 +309,7 @@ app.post('/update-config', (req, res) => {
   }
 });
 
-// 🔄 РУЧНАЯ РОТАЦИЯ ПРОКСИ (для Tampermonkey скрипта)
+// 🔄 УЛУЧШЕННАЯ РУЧНАЯ РОТАЦИЯ ПРОКСИ с очисткой соединений
 app.post('/rotate-proxy', (req, res) => {
   try {
     const { username } = req.body;
@@ -320,6 +341,9 @@ app.post('/rotate-proxy', (req, res) => {
       proxyRotation[username] = { currentIndex: 0 };
     }
 
+    const oldIndex = proxyRotation[username].currentIndex;
+    const oldProxy = client.proxies[oldIndex];
+
     // Переходим к следующему прокси
     proxyRotation[username].currentIndex = 
       (proxyRotation[username].currentIndex + 1) % client.proxies.length;
@@ -327,15 +351,27 @@ app.post('/rotate-proxy', (req, res) => {
     const newProxy = client.proxies[proxyRotation[username].currentIndex];
     const currentIndex = proxyRotation[username].currentIndex;
     
-    console.log(`🔄 Manual proxy rotation for ${username}: ${newProxy} (index: ${currentIndex})`);
+    // 🔄 ОЧИЩАЕМ KEEP-ALIVE СОЕДИНЕНИЯ
+    clearKeepAliveConnections(username);
+    
+    // 🧹 Принудительная сборка мусора если доступна
+    if (global.gc) {
+      global.gc();
+    }
+    
+    console.log(`🔄 Manual proxy rotation for ${username}: ${oldProxy} → ${newProxy} (index: ${oldIndex} → ${currentIndex})`);
+    console.log(`🧹 Cleared keep-alive connections for ${username}`);
     
     res.json({ 
       success: true, 
       message: 'Proxy rotated successfully',
       username: username,
+      old_proxy: oldProxy,
       current_proxy: newProxy,
+      old_index: oldIndex,
       current_index: currentIndex,
-      total_proxies: client.proxies.length
+      total_proxies: client.proxies.length,
+      connections_cleared: true
     });
     
   } catch (error) {
@@ -391,7 +427,7 @@ app.get('/current-proxy/:username', (req, res) => {
   }
 });
 
-// 🎯 УСТАНОВИТЬ КОНКРЕТНЫЙ ПРОКСИ ПО ИНДЕКСУ
+// 🎯 УСТАНОВИТЬ КОНКРЕТНЫЙ ПРОКСИ ПО ИНДЕКСУ с очисткой соединений
 app.post('/set-proxy-index', (req, res) => {
   try {
     const { username, index } = req.body;
@@ -438,18 +474,33 @@ app.post('/set-proxy-index', (req, res) => {
       proxyRotation[username] = { currentIndex: 0 };
     }
     
+    const oldIndex = proxyRotation[username].currentIndex;
+    const oldProxy = client.proxies[oldIndex];
+    
     proxyRotation[username].currentIndex = proxyIndex;
     const selectedProxy = client.proxies[proxyIndex];
     
-    console.log(`🎯 Set proxy index for ${username}: ${selectedProxy} (index: ${proxyIndex})`);
+    // 🔄 ОЧИЩАЕМ KEEP-ALIVE СОЕДИНЕНИЯ
+    clearKeepAliveConnections(username);
+    
+    // 🧹 Принудительная сборка мусора если доступна
+    if (global.gc) {
+      global.gc();
+    }
+    
+    console.log(`🎯 Set proxy index for ${username}: ${oldProxy} → ${selectedProxy} (index: ${oldIndex} → ${proxyIndex})`);
+    console.log(`🧹 Cleared keep-alive connections for ${username}`);
     
     res.json({ 
       success: true, 
       message: 'Proxy index set successfully',
       username: username,
+      old_proxy: oldProxy,
       current_proxy: selectedProxy,
+      old_index: oldIndex,
       current_index: proxyIndex,
-      total_proxies: client.proxies.length
+      total_proxies: client.proxies.length,
+      connections_cleared: true
     });
     
   } catch (error) {
@@ -689,6 +740,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log('🤖 Managed by Telegram Bot');
   console.log('🔄 Manual proxy rotation: ENABLED');
   console.log('⚡ Tampermonkey control: READY');
+  console.log('🧹 Keep-alive connection clearing: ENABLED');
   console.log('✅ Server started successfully');
   
   // Загружаем конфигурации при запуске

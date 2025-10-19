@@ -1,4 +1,4 @@
-// app.js — Railway Proxy + Telegram Bot Management (SIMPLE TURBO)
+// app.js — Railway Proxy + Telegram Bot Management (Optimized for 32GB RAM)
 const express = require('express');
 const http = require('http');
 const https = require('https');
@@ -6,46 +6,22 @@ const net = require('net');
 const { URL } = require('url');
 const fs = require('fs').promises;
 const path = require('path');
-const compression = require('compression');
 
 const app = express();
-
-// ====== ОПТИМИЗАЦИЯ EXPRESS БЕЗ КЛАСТЕРИЗАЦИИ ======
-app.use(compression({
-  level: 6,
-  threshold: 1024,
-  filter: (req, res) => {
-    if (req.headers['x-no-compression']) return false;
-    return compression.filter(req, res);
-  }
-}));
-
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// Отключаем ненужные заголовки
-app.disable('x-powered-by');
-app.disable('etag');
-
-// ====== КОНФИГУРАЦИЯ С ФАЙЛОВЫМ ХРАНЕНИЕМ ======
+// ====== ОПТИМИЗИРОВАННАЯ КОНФИГУРАЦИЯ ДЛЯ ВЫСОКОЙ НАГРУЗКИ ======
 const CONFIG_FILE = path.join(__dirname, 'clients-config.json');
+
+// Пустая конфигурация - все клиенты добавляются через Telegram бота
 let clientsConfig = {};
 
-// ====== ПРОСТОЕ КЭШИРОВАНИЕ ======
-const configCache = new Map();
-const proxyCache = new Map();
-let cacheExpiry = 0;
-
+// ====== ФУНКЦИИ УПРАВЛЕНИЯ КОНФИГУРАЦИЕЙ ======
 async function loadConfig() {
   try {
     const data = await fs.readFile(CONFIG_FILE, 'utf8');
     clientsConfig = JSON.parse(data);
-    
-    // Обновляем кэш
-    configCache.clear();
-    proxyCache.clear();
-    cacheExpiry = Date.now() + 30000;
-    
     console.log('✅ Configuration loaded from file');
   } catch (error) {
     console.log('📝 Using empty configuration, creating config file...');
@@ -56,12 +32,6 @@ async function loadConfig() {
 async function saveConfig() {
   try {
     await fs.writeFile(CONFIG_FILE, JSON.stringify(clientsConfig, null, 2));
-    
-    // Обновляем кэш
-    configCache.clear();
-    proxyCache.clear();
-    cacheExpiry = Date.now() + 30000;
-    
     console.log('💾 Configuration saved to file');
   } catch (error) {
     console.error('❌ Failed to save configuration:', error.message);
@@ -80,14 +50,14 @@ const blockedProxies = new Set();
 
 // ====== ИНИЦИАЛИЗАЦИЯ КЛИЕНТОВ ======
 function initializeClients() {
-  const startTime = Date.now();
-  
+  // Очищаем старые данные
   users = {};
   clientProxies = {};
   allProxySets = {};
   currentProxies = {};
   rotationCounters = {};
   
+  // Инициализируем из конфигурации
   Object.keys(clientsConfig).forEach(clientName => {
     const config = clientsConfig[clientName];
     users[clientName] = config.password;
@@ -100,7 +70,7 @@ function initializeClients() {
     console.log(`✅ Initialized client: ${clientName} with ${config.proxies.length} proxies`);
   });
 
-  console.log(`✅ Initialized ${Object.keys(clientsConfig).length} clients in ${Date.now() - startTime}ms`);
+  // Проверяем пересечения
   checkProxyOverlaps();
 }
 
@@ -121,17 +91,10 @@ function checkProxyOverlaps() {
   }
 }
 
-// ====== API ДЛЯ TELEGRAM БОТА (С КЭШИРОВАНИЕМ) ======
+// ====== API ДЛЯ TELEGRAM БОТА ======
 
+// Получить всех клиентов
 app.get('/api/clients', (req, res) => {
-  const cacheKey = 'clients_list';
-  
-  if (configCache.has(cacheKey) && Date.now() < cacheExpiry) {
-    const cached = configCache.get(cacheKey);
-    cached.cached = true;
-    return res.json(cached);
-  }
-  
   const clients = {};
   Object.keys(clientsConfig).forEach(clientName => {
     clients[clientName] = {
@@ -143,15 +106,11 @@ app.get('/api/clients', (req, res) => {
     };
   });
   
-  const result = {
+  res.json({
     success: true,
     clients,
-    totalClients: Object.keys(clients).length,
-    cached: false
-  };
-  
-  configCache.set(cacheKey, result);
-  res.json(result);
+    totalClients: Object.keys(clients).length
+  });
 });
 
 // Добавить клиента
@@ -194,6 +153,7 @@ app.delete('/api/delete-client/:clientName', async (req, res) => {
     return res.status(404).json({ error: 'Client not found' });
   }
   
+  // Закрываем все активные туннели клиента
   const killed = closeUserTunnels(clientName);
   
   delete clientsConfig[clientName];
@@ -209,7 +169,7 @@ app.delete('/api/delete-client/:clientName', async (req, res) => {
   });
 });
 
-// Алиас для старого API
+// Алиас для старого API (для совместимости)
 app.delete('/api/remove-client/:clientName', async (req, res) => {
   const { clientName } = req.params;
   
@@ -244,6 +204,7 @@ app.post('/api/add-proxy', async (req, res) => {
     return res.status(404).json({ error: 'Client not found' });
   }
   
+  // Проверяем формат прокси
   if (!proxy.startsWith('http://') || !proxy.includes('@')) {
     return res.status(400).json({ error: 'Invalid proxy format. Use: http://user:pass@host:port' });
   }
@@ -278,6 +239,7 @@ app.delete('/api/remove-proxy', async (req, res) => {
     return res.status(404).json({ error: 'Client not found' });
   }
   
+  // Ищем прокси по полному URL или по host:port
   let proxyToRemove = null;
   if (proxy.startsWith('http://')) {
     proxyToRemove = proxy;
@@ -303,7 +265,7 @@ app.delete('/api/remove-proxy', async (req, res) => {
   });
 });
 
-// Ротация прокси для клиента
+// Ротация прокси для клиента (для Telegram бота)
 app.post('/api/rotate-client', async (req, res) => {
   const { clientName } = req.body;
   
@@ -331,9 +293,12 @@ app.post('/api/rotate-client', async (req, res) => {
   });
 });
 
-// ====== МОНИТОРИНГ API ======
+// ====== НОВЫЕ API ДЛЯ МОНИТОРИНГА И СТАТИСТИКИ ======
+
+// Детальная информация о здоровье сервера
 app.get('/health-detailed', (req, res) => {
   const memUsage = process.memoryUsage();
+  const cpuUsage = process.cpuUsage();
   
   res.json({
     status: 'healthy',
@@ -341,19 +306,50 @@ app.get('/health-detailed', (req, res) => {
       rss: Math.round(memUsage.rss / 1024 / 1024) + 'MB',
       heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024) + 'MB',
       heapTotal: Math.round(memUsage.heapTotal / 1024 / 1024) + 'MB',
-      external: Math.round(memUsage.external / 1024 / 1024) + 'MB'
+      external: Math.round(memUsage.external / 1024 / 1024) + 'MB',
+      arrayBuffers: Math.round(memUsage.arrayBuffers / 1024 / 1024) + 'MB'
+    },
+    cpu: {
+      user: cpuUsage.user,
+      system: cpuUsage.system
     },
     uptime: Math.round(process.uptime()),
     clients: Object.keys(clientsConfig).length,
     totalProxies: Object.values(clientsConfig).reduce((sum, client) => sum + client.proxies.length, 0),
     activeTunnels: Object.values(activeTunnels).reduce((sum, set) => sum + set.size, 0),
     blockedProxies: blockedProxies.size,
-    cacheSize: configCache.size,
     timestamp: new Date().toISOString()
   });
 });
 
-// ====== ОПТИМИЗИРОВАННЫЕ ФУНКЦИИ ПРОКСИ СЕРВЕРА ======
+// Статистика по клиентам
+app.get('/api/stats', (req, res) => {
+  const stats = {
+    server: {
+      uptime: Math.round(process.uptime()),
+      memory: process.memoryUsage(),
+      totalClients: Object.keys(clientsConfig).length,
+      totalProxies: Object.values(clientsConfig).reduce((sum, client) => sum + client.proxies.length, 0),
+      totalActiveTunnels: Object.values(activeTunnels).reduce((sum, set) => sum + set.size, 0),
+      blockedProxies: blockedProxies.size
+    },
+    clients: {}
+  };
+
+  Object.keys(clientsConfig).forEach(clientName => {
+    stats.clients[clientName] = {
+      totalProxies: clientProxies[clientName]?.length || 0,
+      currentProxy: getCurrentProxy(clientName)?.split('@')[1],
+      rotationCount: rotationCounters[clientName] || 0,
+      activeTunnels: activeTunnels[clientName]?.size || 0,
+      lastRotation: lastRotationTime.get(clientName) || 0
+    };
+  });
+
+  res.json(stats);
+});
+
+// ====== ОРИГИНАЛЬНЫЕ ФУНКЦИИ ПРОКСИ СЕРВЕРА ======
 
 function closeUserTunnels(username) {
   const set = activeTunnels[username];
@@ -369,23 +365,10 @@ function closeUserTunnels(username) {
 }
 
 function parseProxyUrl(proxyUrl) {
-  if (proxyCache.has(proxyUrl)) {
-    return proxyCache.get(proxyUrl);
-  }
-  
   try {
     const u = new URL(proxyUrl);
-    const result = { 
-      host: u.hostname, 
-      port: +u.port, 
-      username: u.username, 
-      password: u.password 
-    };
-    proxyCache.set(proxyUrl, result);
-    return result;
-  } catch { 
-    return null; 
-  }
+    return { host: u.hostname, port: +u.port, username: u.username, password: u.password };
+  } catch { return null; }
 }
 
 function getCurrentProxy(username) {
@@ -407,6 +390,7 @@ async function rotateProxy(username) {
   list.push(oldProxy);
   rotationCounters[username]++;
 
+  // Пропускаем заблокированные прокси
   let attempts = 0;
   while (blockedProxies.has(list[0]) && attempts < list.length) {
     const blocked = list.shift();
@@ -414,10 +398,10 @@ async function rotateProxy(username) {
     attempts++;
   }
 
-  await new Promise(resolve => setTimeout(resolve, 200)); // Быстрая ротация
+  await new Promise(resolve => setTimeout(resolve, 300)); // Уменьшено с 500ms до 300ms
 
   const newProxy = list[0];
-  console.log(`🔄 ROTATE ${username}: ${oldProxy.split('@')[1]} -> ${newProxy.split('@')[1]} (#${rotationCounters[username]}) [TURBO]`);
+  console.log(`🔄 ROTATE ${username}: ${oldProxy.split('@')[1]} -> ${newProxy.split('@')[1]} (#${rotationCounters[username]}) [CONCURRENT]`);
   return newProxy;
 }
 
@@ -429,26 +413,7 @@ function authenticate(authHeader) {
   } catch { return null; }
 }
 
-// ====== ОПТИМИЗИРОВАННЫЕ АГЕНТЫ ======
-const upstreamAgent = new http.Agent({
-  keepAlive: true,
-  maxSockets: 800,
-  maxFreeSockets: 150,
-  timeout: 30000,
-  keepAliveMsecs: 6000,
-  maxTotalSockets: 1500
-});
-
-const upstreamHttpsAgent = new https.Agent({
-  keepAlive: true,
-  maxSockets: 800,
-  maxFreeSockets: 150,
-  timeout: 30000,
-  keepAliveMsecs: 6000,
-  maxTotalSockets: 1500
-});
-
-// ====== API ENDPOINTS ======
+// ====== ОРИГИНАЛЬНЫЕ API ENDPOINTS ======
 const PUBLIC_HOST = (process.env.PUBLIC_HOST || 'yamabiko.proxy.rlwy.net:38659').toLowerCase();
 const EXTRA_HOSTS = (process.env.EXTRA_HOSTS || '')
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
@@ -483,10 +448,25 @@ function isSelfApiRequest(req) {
   return false;
 }
 
-app.use((req, res, next) => { 
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('Keep-Alive', 'timeout=30, max=1000');
-  next(); 
+app.use((req, res, next) => { res.setHeader('Connection', 'close'); next(); });
+
+// ====== ОПТИМИЗИРОВАННЫЕ АГЕНТЫ ДЛЯ ВЫСОКОЙ НАГРУЗКИ ======
+const upstreamAgent = new http.Agent({
+  keepAlive: true,
+  maxSockets: 500,        // Увеличено для высокой нагрузки
+  maxFreeSockets: 100,    // Увеличено для высокой нагрузки
+  timeout: 45000,
+  keepAliveMsecs: 8000,   // Уменьшено для более быстрого освобождения
+  maxTotalSockets: 1000   // Общий лимит сокетов
+});
+
+const upstreamHttpsAgent = new https.Agent({
+  keepAlive: true,
+  maxSockets: 500,
+  maxFreeSockets: 100,
+  timeout: 45000,
+  keepAliveMsecs: 8000,
+  maxTotalSockets: 1000
 });
 
 // Оригинальные API endpoints
@@ -498,18 +478,18 @@ app.post('/rotate', async (req, res) => {
   const newProxy = await rotateProxy(user);
   const killed = closeUserTunnels(user);
 
-  console.log(`[API] POST /rotate user=${user} killed=${killed} ${oldProxy?.split('@')[1]} -> ${newProxy?.split('@')[1]} [TURBO]`);
+  console.log(`[API] POST /rotate user=${user} killed=${killed} ${oldProxy?.split('@')[1]} -> ${newProxy?.split('@')[1]} [CONCURRENT]`);
 
   res.json({
     success: true,
-    message: 'Proxy rotated (turbo mode)',
+    message: 'Proxy rotated (concurrent mode)',
     oldProxy: oldProxy?.split('@')[1],
     newProxy: newProxy?.split('@')[1],
     rotationCount: rotationCounters[user],
     totalProxies: currentProxies[user].length,
     blockedProxies: blockedProxies.size,
     closedTunnels: killed,
-    turboMode: true,
+    concurrentMode: true,
     rotationTime: Date.now() - (lastRotationTime.get(user) || Date.now())
   });
 });
@@ -529,13 +509,12 @@ app.get('/current', (req, res) => {
     rotationCount: rotationCounters[user],
     activeTunnels: activeTunnels[user].size,
     blockedProxies: blockedProxies.size,
-    turboMode: true,
+    concurrentMode: true,
     lastRotation: lastRotationTime.get(user) || 0
   });
 });
 
 app.get('/myip', async (req, res) => {
-  const startTime = Date.now();
   const user = authenticate(req.headers['authorization']);
   if (!user) return res.status(401).json({ error: 'Unauthorized' });
 
@@ -569,7 +548,7 @@ app.get('/myip', async (req, res) => {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         },
         agent: upstreamAgent,
-        timeout: 12000
+        timeout: 15000 // Уменьшено с 20000ms
       };
 
       const proxyReq = http.request(proxyOptions, (proxyRes) => {
@@ -594,12 +573,7 @@ app.get('/myip', async (req, res) => {
         });
       });
 
-      proxyReq.on('socket', s => { 
-        try { 
-          s.setNoDelay(true); 
-          s.setKeepAlive(true, 6000); 
-        } catch {} 
-      });
+      proxyReq.on('socket', s => { try { s.setNoDelay(true); s.setKeepAlive(true, 8000); } catch {} });
       proxyReq.on('timeout', () => proxyReq.destroy(new Error('Timeout')));
       proxyReq.on('error', reject);
       proxyReq.end();
@@ -608,15 +582,8 @@ app.get('/myip', async (req, res) => {
 
   try {
     const result = await Promise.any(ipServices.map(fetchViaProxy));
-    const responseTime = Date.now() - startTime;
-    console.log(`[API] /myip result for ${user}: ${result.ip} via ${result.service} (${responseTime}ms)`);
-    return res.json({ 
-      ip: result.ip, 
-      proxy: `${up.host}:${up.port}`, 
-      service: result.service,
-      responseTime,
-      turboMode: true
-    });
+    console.log(`[API] /myip result for ${user}: ${result.ip} via ${result.service}`);
+    return res.json({ ip: result.ip, proxy: `${up.host}:${up.port}`, service: result.service });
   } catch (err) {
     console.error(`[API] /myip all services failed for ${user}: ${err?.message}`);
     return res.status(502).json({ error: 'Failed to get IP from all services', lastError: err?.message });
@@ -655,23 +622,18 @@ app.get('/status', (req, res) => {
 
   res.json({
     status: 'running',
-    platform: 'Railway TCP Proxy - Simple Turbo Mode',
+    platform: 'Railway TCP Proxy - Enhanced with Telegram Bot Management (Optimized)',
     port: PORT,
     publicHost: PUBLIC_HOST,
     selfHostnames: [...SELF_HOSTNAMES],
     totalBlockedProxies: blockedProxies.size,
-    turboMode: true,
+    concurrentMode: true,
     telegramBotEnabled: true,
-    optimizedFor: '32GB RAM - Simple Turbo',
+    optimizedFor: '32GB RAM - High Load',
     memory: {
       rss: Math.round(memUsage.rss / 1024 / 1024) + 'MB',
       heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024) + 'MB',
       heapTotal: Math.round(memUsage.heapTotal / 1024 / 1024) + 'MB'
-    },
-    cache: {
-      configCacheSize: configCache.size,
-      proxyCacheSize: proxyCache.size,
-      cacheExpiry: new Date(cacheExpiry).toISOString()
     },
     proxyIsolation: {
       overlappingProxies: totalOverlapping,
@@ -707,26 +669,26 @@ app.get('/', (req, res) => {
   const memUsage = process.memoryUsage();
 
   res.send(`
-    <h1>🚀 Railway Proxy Rotator - Simple Turbo Mode</h1>
+    <h1>🚀 Railway Proxy Rotator - Enhanced & Optimized (32GB RAM)</h1>
     <pre>
 Public host: ${PUBLIC_HOST}
 Known hostnames: ${[...SELF_HOSTNAMES].join(', ')}
 
 Auth: Basic (${authInfo})
 
-⚡ Simple Turbo Features:
-- Gzip compression enabled
-- Response caching (30s)
-- Optimized agents (800 sockets)
-- Fast rotation (200ms delay)
-- Keep-alive connections
-- 32GB RAM optimized
+⚡ Enhanced Features:
+- Telegram Bot Management API
+- Dynamic client/proxy management
+- File-based configuration persistence
+- Hot reload without restart
+- Concurrent rotation mode
+- Optimized for high load (500+ connections)
+- 32GB RAM configuration
 
 📊 Current Status:
 - Memory: ${Math.round(memUsage.rss / 1024 / 1024)}MB / 32GB
 - Uptime: ${Math.round(process.uptime())}s
 - Active tunnels: ${Object.values(activeTunnels).reduce((sum, set) => sum + set.size, 0)}
-- Cache size: ${configCache.size} items
     </pre>
     <h2>Original API:</h2>
     <ul>
@@ -737,7 +699,7 @@ Auth: Basic (${authInfo})
     </ul>
     <h2>Telegram Bot API:</h2>
     <ul>
-      <li>GET /api/clients - list all clients (cached)</li>
+      <li>GET /api/clients - list all clients</li>
       <li>POST /api/add-client - add new client</li>
       <li>DELETE /api/delete-client/:name - delete client</li>
       <li>DELETE /api/remove-client/:name - remove client (alias)</li>
@@ -748,22 +710,23 @@ Auth: Basic (${authInfo})
     <h2>Monitoring API:</h2>
     <ul>
       <li>GET /health-detailed - detailed health check</li>
+      <li>GET /api/stats - comprehensive statistics</li>
     </ul>
     <p>Total clients: ${Object.keys(clientsConfig).length}</p>
     <p>Overlapping proxies: ${totalOverlapping}</p>
     <p>Blocked proxies: ${blockedProxies.size}</p>
     <p>Memory usage: ${Math.round(memUsage.rss / 1024 / 1024)}MB</p>
-    <p>🚀 Simple Turbo Mode: Fast & Stable</p>
   `);
 });
 
-// ====== ОПТИМИЗИРОВАННЫЙ ПРОКСИ СЕРВЕР ======
+// ====== ПРОКСИ СЕРВЕР (ОПТИМИЗИРОВАННЫЙ) ======
 const server = http.createServer();
 
-server.maxConnections = 3000;
-server.timeout = 35000;
+// Увеличиваем лимиты сервера
+server.maxConnections = 2000; // Увеличено для высокой нагрузки
+server.timeout = 60000;
 server.keepAliveTimeout = 30000;
-server.headersTimeout = 32000;
+server.headersTimeout = 35000;
 
 async function handleHttpProxy(req, res, user) {
   const up = parseProxyUrl(getCurrentProxy(user));
@@ -781,7 +744,7 @@ async function handleHttpProxy(req, res, user) {
       'Proxy-Authorization': `Basic ${Buffer.from(`${up.username}:${up.password}`).toString('base64')}`,
     },
     agent: req.url.startsWith('https://') ? upstreamHttpsAgent : upstreamAgent,
-    timeout: 30000
+    timeout: 40000 // Уменьшено с 45000ms
   };
   delete options.headers['proxy-authorization'];
 
@@ -793,8 +756,8 @@ async function handleHttpProxy(req, res, user) {
   proxyReq.on('socket', s => { 
     try { 
       s.setNoDelay(true); 
-      s.setKeepAlive(true, 6000);
-      s.setTimeout(30000);
+      s.setKeepAlive(true, 8000); // Уменьшено с 10000ms
+      s.setTimeout(40000);
     } catch {} 
   });
   proxyReq.on('timeout', () => proxyReq.destroy(new Error('Upstream timeout')));
@@ -842,15 +805,15 @@ function tryConnect(req, clientSocket, user) {
 
   try { 
     proxySocket.setNoDelay(true); 
-    proxySocket.setKeepAlive(true, 6000);
+    proxySocket.setKeepAlive(true, 8000); // Уменьшено с 10000ms
   } catch {}
   try { 
     clientSocket.setNoDelay(true); 
-    clientSocket.setKeepAlive(true, 6000);
+    clientSocket.setKeepAlive(true, 8000); // Уменьшено с 10000ms
   } catch {}
 
-  proxySocket.setTimeout(35000, () => proxySocket.destroy(new Error('upstream timeout')));
-  clientSocket.setTimeout(35000, () => clientSocket.destroy(new Error('client timeout')));
+  proxySocket.setTimeout(40000, () => proxySocket.destroy(new Error('upstream timeout'))); // Уменьшено с 45000ms
+  clientSocket.setTimeout(40000, () => clientSocket.destroy(new Error('client timeout'))); // Уменьшено с 45000ms
 
   proxySocket.on('connect', () => {
     const auth = Buffer.from(`${up.username}:${up.password}`).toString('base64');
@@ -922,14 +885,13 @@ async function startServer() {
 
     const memUsage = process.memoryUsage();
 
-    console.log(`🚀 Simple Turbo Proxy server running on port ${PORT}`);
+    console.log(`🚀 Enhanced Proxy server running on port ${PORT} (OPTIMIZED FOR 32GB RAM)`);
     console.log(`🌐 Public (TCP Proxy): ${PUBLIC_HOST}`);
     console.log(`✅ API self hostnames: ${[...SELF_HOSTNAMES].join(', ')}`);
     console.log(`🤖 Telegram Bot API enabled`);
     console.log(`💾 Memory usage: ${Math.round(memUsage.rss / 1024 / 1024)}MB / 32GB available`);
     console.log(`🔧 Max connections: ${server.maxConnections}`);
     console.log(`🔧 Agent max sockets: ${upstreamAgent.maxSockets}`);
-    console.log(`⚡ Simple Turbo Mode: Gzip + Caching + Fast rotation`);
     
     if (Object.keys(clientsConfig).length === 0) {
       console.log(`📝 No clients configured - use Telegram bot to add clients`);
@@ -939,9 +901,10 @@ async function startServer() {
       });
     }
     
+    console.log(`⚡ Concurrent mode: NO rotation locks`);
     console.log(`🔍 Overlapping proxies: ${totalOverlapping}`);
     console.log(`💾 Configuration file: ${CONFIG_FILE}`);
-    console.log(`📈 Optimized for: 300-500+ concurrent users`);
+    console.log(`📈 Optimized for: 200-500+ concurrent users`);
 
     if (totalOverlapping > 0) {
       console.warn(`⚠️  WARNING: ${totalOverlapping} overlapping proxies may cause interference`);

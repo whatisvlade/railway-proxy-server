@@ -1,7 +1,7 @@
 {
   "name": "enhanced-proxy-server",
   "version": "1.0.0",
-  "main": "node enhanced-proxy-server.js",
+  "main": "enhanced-proxy-serverjs",
   "scripts": {
     "start": "node enhanced-proxy-server.js"
   },

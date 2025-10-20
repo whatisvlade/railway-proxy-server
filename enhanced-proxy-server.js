@@ -1,4 +1,4 @@
-// app.js — Railway Proxy + Telegram Bot Management (Optimized for 32GB RAM + Speed)
+// app.js — Railway Proxy + Telegram Bot Management (Optimized for 32GB RAM)
 const express = require('express');
 const http = require('http');
 const https = require('https');
@@ -11,7 +11,7 @@ const app = express();
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// ====== ОПТИМИЗИРОВАННАЯ КОНФИГУРАЦИЯ ДЛЯ ВЫСОКОЙ НАГРУЗКИ + СКОРОСТЬ ======
+// ====== ОПТИМИЗИРОВАННАЯ КОНФИГУРАЦИЯ ДЛЯ ВЫСОКОЙ НАГРУЗКИ ======
 const CONFIG_FILE = path.join(__dirname, 'clients-config.json');
 
 // Пустая конфигурация - все клиенты добавляются через Telegram бота
@@ -398,7 +398,7 @@ async function rotateProxy(username) {
     attempts++;
   }
 
-  await new Promise(resolve => setTimeout(resolve, 100)); // Уменьшено с 300ms до 100ms
+  await new Promise(resolve => setTimeout(resolve, 300)); // Уменьшено с 500ms до 300ms
 
   const newProxy = list[0];
   console.log(`🔄 ROTATE ${username}: ${oldProxy.split('@')[1]} -> ${newProxy.split('@')[1]} (#${rotationCounters[username]}) [CONCURRENT]`);
@@ -450,25 +450,23 @@ function isSelfApiRequest(req) {
 
 app.use((req, res, next) => { res.setHeader('Connection', 'close'); next(); });
 
-// ====== МАКСИМАЛЬНО ОПТИМИЗИРОВАННЫЕ АГЕНТЫ ДЛЯ СКОРОСТИ ======
+// ====== ОПТИМИЗИРОВАННЫЕ АГЕНТЫ ДЛЯ ВЫСОКОЙ НАГРУЗКИ ======
 const upstreamAgent = new http.Agent({
   keepAlive: true,
-  maxSockets: 1000,        // Увеличено для максимальной скорости
-  maxFreeSockets: 200,     // Увеличено для переиспользования соединений
-  timeout: 30000,          // Уменьшено для быстрого отклика
-  keepAliveMsecs: 5000,    // Уменьшено для быстрого освобождения
-  maxTotalSockets: 2000,   // Максимальный лимит сокетов
-  scheduling: 'fifo'       // FIFO для лучшей производительности
+  maxSockets: 500,        // Увеличено для высокой нагрузки
+  maxFreeSockets: 100,    // Увеличено для высокой нагрузки
+  timeout: 45000,
+  keepAliveMsecs: 8000,   // Уменьшено для более быстрого освобождения
+  maxTotalSockets: 1000   // Общий лимит сокетов
 });
 
 const upstreamHttpsAgent = new https.Agent({
   keepAlive: true,
-  maxSockets: 1000,
-  maxFreeSockets: 200,
-  timeout: 30000,
-  keepAliveMsecs: 5000,
-  maxTotalSockets: 2000,
-  scheduling: 'fifo'
+  maxSockets: 500,
+  maxFreeSockets: 100,
+  timeout: 45000,
+  keepAliveMsecs: 8000,
+  maxTotalSockets: 1000
 });
 
 // Оригинальные API endpoints
@@ -550,7 +548,7 @@ app.get('/myip', async (req, res) => {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         },
         agent: upstreamAgent,
-        timeout: 10000 // Уменьшено с 15000ms для быстрого ответа
+        timeout: 15000 // Уменьшено с 20000ms
       };
 
       const proxyReq = http.request(proxyOptions, (proxyRes) => {
@@ -575,7 +573,7 @@ app.get('/myip', async (req, res) => {
         });
       });
 
-      proxyReq.on('socket', s => { try { s.setNoDelay(true); s.setKeepAlive(true, 5000); } catch {} });
+      proxyReq.on('socket', s => { try { s.setNoDelay(true); s.setKeepAlive(true, 8000); } catch {} });
       proxyReq.on('timeout', () => proxyReq.destroy(new Error('Timeout')));
       proxyReq.on('error', reject);
       proxyReq.end();
@@ -624,14 +622,14 @@ app.get('/status', (req, res) => {
 
   res.json({
     status: 'running',
-    platform: 'Railway TCP Proxy - Enhanced with Telegram Bot Management (Speed Optimized)',
+    platform: 'Railway TCP Proxy - Enhanced with Telegram Bot Management (Optimized)',
     port: PORT,
     publicHost: PUBLIC_HOST,
     selfHostnames: [...SELF_HOSTNAMES],
     totalBlockedProxies: blockedProxies.size,
     concurrentMode: true,
     telegramBotEnabled: true,
-    optimizedFor: '32GB RAM - High Speed',
+    optimizedFor: '32GB RAM - High Load',
     memory: {
       rss: Math.round(memUsage.rss / 1024 / 1024) + 'MB',
       heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024) + 'MB',
@@ -671,7 +669,7 @@ app.get('/', (req, res) => {
   const memUsage = process.memoryUsage();
 
   res.send(`
-    <h1>🚀 Railway Proxy Rotator - Enhanced & Speed Optimized (32GB RAM)</h1>
+    <h1>🚀 Railway Proxy Rotator - Enhanced & Optimized (32GB RAM)</h1>
     <pre>
 Public host: ${PUBLIC_HOST}
 Known hostnames: ${[...SELF_HOSTNAMES].join(', ')}
@@ -684,8 +682,8 @@ Auth: Basic (${authInfo})
 - File-based configuration persistence
 - Hot reload without restart
 - Concurrent rotation mode
-- Speed optimized for high load (1000+ connections)
-- 32GB RAM configuration with speed focus
+- Optimized for high load (500+ connections)
+- 32GB RAM configuration
 
 📊 Current Status:
 - Memory: ${Math.round(memUsage.rss / 1024 / 1024)}MB / 32GB
@@ -721,14 +719,14 @@ Auth: Basic (${authInfo})
   `);
 });
 
-// ====== МАКСИМАЛЬНО ОПТИМИЗИРОВАННЫЙ ПРОКСИ СЕРВЕР ======
+// ====== ПРОКСИ СЕРВЕР (ОПТИМИЗИРОВАННЫЙ) ======
 const server = http.createServer();
 
-// Максимальные лимиты сервера для скорости
-server.maxConnections = 5000; // Увеличено для максимальной нагрузки
-server.timeout = 30000;       // Уменьшено для быстрого отклика
-server.keepAliveTimeout = 15000; // Уменьшено для быстрого освобождения
-server.headersTimeout = 20000;   // Уменьшено для быстрого отклика
+// Увеличиваем лимиты сервера
+server.maxConnections = 2000; // Увеличено для высокой нагрузки
+server.timeout = 60000;
+server.keepAliveTimeout = 30000;
+server.headersTimeout = 35000;
 
 async function handleHttpProxy(req, res, user) {
   const up = parseProxyUrl(getCurrentProxy(user));
@@ -746,7 +744,7 @@ async function handleHttpProxy(req, res, user) {
       'Proxy-Authorization': `Basic ${Buffer.from(`${up.username}:${up.password}`).toString('base64')}`,
     },
     agent: req.url.startsWith('https://') ? upstreamHttpsAgent : upstreamAgent,
-    timeout: 25000 // Уменьшено с 40000ms для быстрого отклика
+    timeout: 40000 // Уменьшено с 45000ms
   };
   delete options.headers['proxy-authorization'];
 
@@ -758,8 +756,8 @@ async function handleHttpProxy(req, res, user) {
   proxyReq.on('socket', s => { 
     try { 
       s.setNoDelay(true); 
-      s.setKeepAlive(true, 5000); // Уменьшено с 8000ms для быстрого освобождения
-      s.setTimeout(25000);
+      s.setKeepAlive(true, 8000); // Уменьшено с 10000ms
+      s.setTimeout(40000);
     } catch {} 
   });
   proxyReq.on('timeout', () => proxyReq.destroy(new Error('Upstream timeout')));
@@ -807,15 +805,15 @@ function tryConnect(req, clientSocket, user) {
 
   try { 
     proxySocket.setNoDelay(true); 
-    proxySocket.setKeepAlive(true, 5000); // Уменьшено с 8000ms для быстрого освобождения
+    proxySocket.setKeepAlive(true, 8000); // Уменьшено с 10000ms
   } catch {}
   try { 
     clientSocket.setNoDelay(true); 
-    clientSocket.setKeepAlive(true, 5000); // Уменьшено с 8000ms для быстрого освобождения
+    clientSocket.setKeepAlive(true, 8000); // Уменьшено с 10000ms
   } catch {}
 
-  proxySocket.setTimeout(25000, () => proxySocket.destroy(new Error('upstream timeout'))); // Уменьшено с 40000ms
-  clientSocket.setTimeout(25000, () => clientSocket.destroy(new Error('client timeout'))); // Уменьшено с 40000ms
+  proxySocket.setTimeout(40000, () => proxySocket.destroy(new Error('upstream timeout'))); // Уменьшено с 45000ms
+  clientSocket.setTimeout(40000, () => clientSocket.destroy(new Error('client timeout'))); // Уменьшено с 45000ms
 
   proxySocket.on('connect', () => {
     const auth = Buffer.from(`${up.username}:${up.password}`).toString('base64');
@@ -863,12 +861,8 @@ server.on('connect', (req, clientSocket) => {
   tryConnect(req, clientSocket, user);
 });
 
-// ====== ЗАПУСК С ОПТИМИЗАЦИЕЙ ======
+// ====== ЗАПУСК ======
 const PORT = process.env.PORT || process.env.RAILWAY_PORT || 8080;
-
-// Оптимизация Node.js для максимальной производительности
-process.env.UV_THREADPOOL_SIZE = '128'; // Увеличиваем пул потоков
-process.setMaxListeners(0); // Убираем лимит на слушатели событий
 
 async function startServer() {
   await loadConfig();
@@ -891,16 +885,13 @@ async function startServer() {
 
     const memUsage = process.memoryUsage();
 
-    console.log(`🚀 Enhanced Proxy server running on port ${PORT} (SPEED OPTIMIZED FOR 32GB RAM)`);
+    console.log(`🚀 Enhanced Proxy server running on port ${PORT} (OPTIMIZED FOR 32GB RAM)`);
     console.log(`🌐 Public (TCP Proxy): ${PUBLIC_HOST}`);
     console.log(`✅ API self hostnames: ${[...SELF_HOSTNAMES].join(', ')}`);
     console.log(`🤖 Telegram Bot API enabled`);
     console.log(`💾 Memory usage: ${Math.round(memUsage.rss / 1024 / 1024)}MB / 32GB available`);
-    console.log(`🔧 Max connections: ${server.maxConnections} (SPEED OPTIMIZED)`);
-    console.log(`🔧 Agent max sockets: ${upstreamAgent.maxSockets} (SPEED OPTIMIZED)`);
-    console.log(`⚡ UV_THREADPOOL_SIZE: ${process.env.UV_THREADPOOL_SIZE}`);
-    console.log(`⚡ Rotation delay: 100ms (SPEED OPTIMIZED)`);
-    console.log(`⚡ Socket timeouts: 25s (SPEED OPTIMIZED)`);
+    console.log(`🔧 Max connections: ${server.maxConnections}`);
+    console.log(`🔧 Agent max sockets: ${upstreamAgent.maxSockets}`);
     
     if (Object.keys(clientsConfig).length === 0) {
       console.log(`📝 No clients configured - use Telegram bot to add clients`);
@@ -913,7 +904,7 @@ async function startServer() {
     console.log(`⚡ Concurrent mode: NO rotation locks`);
     console.log(`🔍 Overlapping proxies: ${totalOverlapping}`);
     console.log(`💾 Configuration file: ${CONFIG_FILE}`);
-    console.log(`📈 Optimized for: 500-1000+ concurrent users with maximum speed`);
+    console.log(`📈 Optimized for: 200-500+ concurrent users`);
 
     if (totalOverlapping > 0) {
       console.warn(`⚠️  WARNING: ${totalOverlapping} overlapping proxies may cause interference`);

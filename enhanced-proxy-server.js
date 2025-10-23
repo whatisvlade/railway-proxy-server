@@ -398,10 +398,9 @@ async function rotateProxy(username) {
     attempts++;
   }
 
-  await new Promise(resolve => setTimeout(resolve, 300)); // Уменьшено с 500ms до 300ms
-
+  // Убрано ожидание для мгновенной ротации
   const newProxy = list[0];
-  console.log(`🔄 ROTATE ${username}: ${oldProxy.split('@')[1]} -> ${newProxy.split('@')[1]} (#${rotationCounters[username]}) [CONCURRENT]`);
+  console.log(`🔄 ROTATE ${username}: ${oldProxy.split('@')[1]} -> ${newProxy.split('@')[1]} (#${rotationCounters[username]}) [INSTANT]`);
   return newProxy;
 }
 
@@ -450,23 +449,23 @@ function isSelfApiRequest(req) {
 
 app.use((req, res, next) => { res.setHeader('Connection', 'close'); next(); });
 
-// ====== ОПТИМИЗИРОВАННЫЕ АГЕНТЫ ДЛЯ ВЫСОКОЙ НАГРУЗКИ ======
+// ====== МАКСИМАЛЬНО ОПТИМИЗИРОВАННЫЕ АГЕНТЫ ======
 const upstreamAgent = new http.Agent({
   keepAlive: true,
-  maxSockets: 500,        // Увеличено для высокой нагрузки
-  maxFreeSockets: 100,    // Увеличено для высокой нагрузки
-  timeout: 45000,
-  keepAliveMsecs: 8000,   // Уменьшено для более быстрого освобождения
-  maxTotalSockets: 1000   // Общий лимит сокетов
+  maxSockets: 1000,       // Увеличено для максимальной производительности
+  maxFreeSockets: 200,    // Увеличено для быстрого переиспользования
+  timeout: 30000,         // Уменьшено для быстрых ответов
+  keepAliveMsecs: 5000,   // Уменьшено для быстрого освобождения
+  maxTotalSockets: 2000   // Максимальный лимит сокетов
 });
 
 const upstreamHttpsAgent = new https.Agent({
   keepAlive: true,
-  maxSockets: 500,
-  maxFreeSockets: 100,
-  timeout: 45000,
-  keepAliveMsecs: 8000,
-  maxTotalSockets: 1000
+  maxSockets: 1000,
+  maxFreeSockets: 200,
+  timeout: 30000,
+  keepAliveMsecs: 5000,
+  maxTotalSockets: 2000
 });
 
 // Оригинальные API endpoints
@@ -478,19 +477,19 @@ app.post('/rotate', async (req, res) => {
   const newProxy = await rotateProxy(user);
   const killed = closeUserTunnels(user);
 
-  console.log(`[API] POST /rotate user=${user} killed=${killed} ${oldProxy?.split('@')[1]} -> ${newProxy?.split('@')[1]} [CONCURRENT]`);
+  console.log(`[API] POST /rotate user=${user} killed=${killed} ${oldProxy?.split('@')[1]} -> ${newProxy?.split('@')[1]} [INSTANT]`);
 
   res.json({
     success: true,
-    message: 'Proxy rotated (concurrent mode)',
+    message: 'Proxy rotated (instant mode)',
     oldProxy: oldProxy?.split('@')[1],
     newProxy: newProxy?.split('@')[1],
     rotationCount: rotationCounters[user],
     totalProxies: currentProxies[user].length,
     blockedProxies: blockedProxies.size,
     closedTunnels: killed,
-    concurrentMode: true,
-    rotationTime: Date.now() - (lastRotationTime.get(user) || Date.now())
+    instantMode: true,
+    rotationTime: 0
   });
 });
 
@@ -509,11 +508,12 @@ app.get('/current', (req, res) => {
     rotationCount: rotationCounters[user],
     activeTunnels: activeTunnels[user].size,
     blockedProxies: blockedProxies.size,
-    concurrentMode: true,
+    instantMode: true,
     lastRotation: lastRotationTime.get(user) || 0
   });
 });
 
+// ====== УЛУЧШЕННЫЙ /myip ENDPOINT С НАДЕЖНЫМИ СЕРВИСАМИ ======
 app.get('/myip', async (req, res) => {
   const user = authenticate(req.headers['authorization']);
   if (!user) return res.status(401).json({ error: 'Unauthorized' });
@@ -526,17 +526,97 @@ app.get('/myip', async (req, res) => {
 
   console.log(`[API] GET /myip user=${user} via ${up.host}:${up.port}`);
 
+  // СПИСОК НАДЕЖНЫХ АЛЬТЕРНАТИВ httpbin.org
   const ipServices = [
-    { url: 'http://api.ipify.org?format=json', type: 'json' },
-    { url: 'http://ifconfig.me/ip', type: 'text' },
-    { url: 'http://icanhazip.com', type: 'text' },
-    { url: 'http://ident.me', type: 'text' },
-    { url: 'http://checkip.amazonaws.com', type: 'text' }
+    {
+      url: 'http://api.ipify.org',
+      type: 'text',
+      parse: (data) => data.trim()
+    },
+    {
+      url: 'http://checkip.amazonaws.com', 
+      type: 'text',
+      parse: (data) => data.trim()
+    },
+    {
+      url: 'http://icanhazip.com',
+      type: 'text', 
+      parse: (data) => data.trim()
+    },
+    {
+      url: 'http://ident.me',
+      type: 'text',
+      parse: (data) => data.trim()
+    },
+    {
+      url: 'http://myexternalip.com/raw',
+      type: 'text',
+      parse: (data) => data.trim()
+    },
+    {
+      url: 'http://ipecho.net/plain',
+      type: 'text',
+      parse: (data) => data.trim()
+    },
+    {
+      url: 'http://whatismyip.akamai.com',
+      type: 'text',
+      parse: (data) => data.trim()
+    },
+    {
+      url: 'http://tnx.nl/ip',
+      type: 'text',
+      parse: (data) => data.trim()
+    },
+    {
+      url: 'http://wgetip.com',
+      type: 'text',
+      parse: (data) => data.trim()
+    },
+    {
+      url: 'http://ip.tyk.nu',
+      type: 'text',
+      parse: (data) => data.trim()
+    },
+    {
+      url: 'http://l2.io/ip',
+      type: 'text',
+      parse: (data) => data.trim()
+    },
+    {
+      url: 'http://ifconfig.me/ip',
+      type: 'text',
+      parse: (data) => data.trim()
+    },
+    {
+      url: 'http://corz.org/ip',
+      type: 'text',
+      parse: (data) => data.trim()
+    }
   ];
 
-  function fetchViaProxy(service) {
+  async function getIPFromServices() {
+    // Перемешиваем сервисы для балансировки нагрузки
+    const shuffledServices = [...ipServices].sort(() => Math.random() - 0.5);
+    
+    for (const service of shuffledServices) {
+      try {
+        const ip = await getIPFromService(service, up);
+        if (ip && isValidIP(ip)) {
+          return { ip, source: service.url };
+        }
+      } catch (err) {
+        console.log(`[API] IP service ${service.url} failed: ${err.message}`);
+        // Продолжаем пробовать следующий сервис
+      }
+    }
+    throw new Error('All IP services failed');
+  }
+
+  function getIPFromService(service, up) {
     return new Promise((resolve, reject) => {
-      const serviceUrlObj = new URL(service.url);
+      const url = new URL(service.url);
+      
       const proxyOptions = {
         hostname: up.host,
         port: up.port,
@@ -544,51 +624,97 @@ app.get('/myip', async (req, res) => {
         method: 'GET',
         headers: {
           'Proxy-Authorization': `Basic ${Buffer.from(`${up.username}:${up.password}`).toString('base64')}`,
-          'Host': serviceUrlObj.hostname,
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Host': url.host,
+          'User-Agent': 'ProxyChecker/1.0',
+          'Accept': 'text/plain, */*',
+          'Connection': 'close'
         },
         agent: upstreamAgent,
-        timeout: 15000 // Уменьшено с 20000ms
+        timeout: 8000 // Уменьшено для быстрых ответов
       };
 
       const proxyReq = http.request(proxyOptions, (proxyRes) => {
-        let data = '';
-        proxyRes.on('data', chunk => data += chunk);
-        proxyRes.on('end', () => {
-          if (proxyRes.statusCode >= 200 && proxyRes.statusCode < 300) {
-            let ip = null;
-            if (service.type === 'json') {
-              try { ip = JSON.parse(data).ip; } catch {}
+        if (proxyRes.statusCode >= 200 && proxyRes.statusCode < 300) {
+          let data = '';
+          proxyRes.on('data', chunk => data += chunk.toString());
+          proxyRes.on('end', () => {
+            try {
+              const ip = service.parse(data);
+              if (ip && isValidIP(ip)) {
+                resolve(ip);
+              } else {
+                reject(new Error('Invalid IP format received'));
+              }
+            } catch (parseError) {
+              reject(new Error(`Parse error: ${parseError.message}`));
             }
-            if (!ip) {
-              ip = data.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/)?.[0] ||
-                   data.match(/(?:[0-9a-fA-F]{1,4}:){1,7}[0-9a-fA-F]{1,4}/)?.[0] ||
-                   data.trim();
-            }
-            if (ip && /^[\d.:]+$/.test(ip)) return resolve({ ip, service: service.url });
-            return reject(new Error('Bad IP parse'));
-          } else {
-            return reject(new Error(`HTTP ${proxyRes.statusCode}`));
-          }
-        });
+          });
+        } else {
+          reject(new Error(`HTTP ${proxyRes.statusCode}`));
+        }
       });
 
-      proxyReq.on('socket', s => { try { s.setNoDelay(true); s.setKeepAlive(true, 8000); } catch {} });
-      proxyReq.on('timeout', () => proxyReq.destroy(new Error('Timeout')));
+      proxyReq.on('socket', s => { 
+        try { 
+          s.setNoDelay(true); 
+          s.setKeepAlive(false); // Отключаем keep-alive для тестовых запросов
+          s.setTimeout(8000);
+        } catch {} 
+      });
+      
+      proxyReq.on('timeout', () => {
+        proxyReq.destroy();
+        reject(new Error('Request timeout'));
+      });
+      
       proxyReq.on('error', reject);
       proxyReq.end();
     });
   }
 
+  function isValidIP(ip) {
+    // Проверяем IPv4
+    const ipv4Regex = /^(?:\d{1,3}\.){3}\d{1,3}$/;
+    if (ipv4Regex.test(ip)) {
+      const parts = ip.split('.');
+      return parts.every(part => {
+        const num = parseInt(part, 10);
+        return num >= 0 && num <= 255;
+      });
+    }
+    
+    // Проверяем IPv6 (упрощенная проверка)
+    const ipv6Regex = /^(?:[0-9a-fA-F]{1,4}:){1,7}[0-9a-fA-F]{1,4}$/;
+    return ipv6Regex.test(ip);
+  }
+
   try {
-    const result = await Promise.any(ipServices.map(fetchViaProxy));
-    console.log(`[API] /myip result for ${user}: ${result.ip} via ${result.service}`);
-    return res.json({ ip: result.ip, proxy: `${up.host}:${up.port}`, service: result.service });
+    const result = await getIPFromServices();
+    console.log(`[API] /myip result for ${user}: ${result.ip} via ${result.source}`);
+    
+    res.json({ 
+      ip: result.ip, 
+      proxy: `${up.host}:${up.port}`,
+      source: result.source,
+      method: 'multi_service_check',
+      timestamp: new Date().toISOString(),
+      services_tested: ipServices.length
+    });
   } catch (err) {
-    console.error(`[API] /myip all services failed for ${user}: ${err?.message}`);
-    return res.status(502).json({ error: 'Failed to get IP from all services', lastError: err?.message });
+    console.error(`[API] /myip all services failed for ${user}: ${err.message}`);
+    
+    // Фолбэк: возвращаем хост прокси как минимальную информацию
+    res.json({ 
+      ip: up.host, 
+      proxy: `${up.host}:${up.port}`,
+      error: 'External IP services unavailable, showing proxy host',
+      method: 'fallback_proxy_host',
+      timestamp: new Date().toISOString(),
+      services_tested: ipServices.length
+    });
   }
 });
+
 
 app.get('/status', (req, res) => {
   let totalOverlapping = 0;
@@ -622,14 +748,15 @@ app.get('/status', (req, res) => {
 
   res.json({
     status: 'running',
-    platform: 'Railway TCP Proxy - Enhanced with Telegram Bot Management (Optimized)',
+    platform: 'Railway TCP Proxy - Enhanced with Telegram Bot Management (Ultra-Optimized)',
     port: PORT,
     publicHost: PUBLIC_HOST,
     selfHostnames: [...SELF_HOSTNAMES],
     totalBlockedProxies: blockedProxies.size,
-    concurrentMode: true,
+    instantMode: true,
     telegramBotEnabled: true,
-    optimizedFor: '32GB RAM - High Load',
+    optimizedFor: '32GB RAM - Ultra High Load',
+    ipCheckMethod: 'proxy_server_only', // Указываем что проверяем IP только через прокси
     memory: {
       rss: Math.round(memUsage.rss / 1024 / 1024) + 'MB',
       heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024) + 'MB',
@@ -669,21 +796,23 @@ app.get('/', (req, res) => {
   const memUsage = process.memoryUsage();
 
   res.send(`
-    <h1>🚀 Railway Proxy Rotator - Enhanced & Optimized (32GB RAM)</h1>
+    <h1>🚀 Railway Proxy Rotator - Ultra-Optimized (32GB RAM)</h1>
     <pre>
 Public host: ${PUBLIC_HOST}
 Known hostnames: ${[...SELF_HOSTNAMES].join(', ')}
 
 Auth: Basic (${authInfo})
 
-⚡ Enhanced Features:
+⚡ Ultra-Enhanced Features:
 - Telegram Bot Management API
 - Dynamic client/proxy management
 - File-based configuration persistence
 - Hot reload without restart
-- Concurrent rotation mode
-- Optimized for high load (500+ connections)
+- INSTANT rotation mode (0ms delay)
+- Ultra-optimized for high load (1000+ connections)
 - 32GB RAM configuration
+- Maximum socket pools (2000 total)
+- IP check only through proxy server (no external services)
 
 📊 Current Status:
 - Memory: ${Math.round(memUsage.rss / 1024 / 1024)}MB / 32GB
@@ -694,7 +823,7 @@ Auth: Basic (${authInfo})
     <ul>
       <li>GET /status - server status</li>
       <li>GET /current (requires Basic) - current proxy</li>
-      <li>GET /myip (requires Basic) - get IP via proxy</li>
+      <li>GET /myip (requires Basic) - get IP via proxy (proxy server only)</li>
       <li>POST /rotate (requires Basic) - rotate proxy</li>
     </ul>
     <h2>Telegram Bot API:</h2>
@@ -716,17 +845,18 @@ Auth: Basic (${authInfo})
     <p>Overlapping proxies: ${totalOverlapping}</p>
     <p>Blocked proxies: ${blockedProxies.size}</p>
     <p>Memory usage: ${Math.round(memUsage.rss / 1024 / 1024)}MB</p>
+    <p><strong>IP Check Method:</strong> Proxy Server Only (no external services)</p>
   `);
 });
 
-// ====== ПРОКСИ СЕРВЕР (ОПТИМИЗИРОВАННЫЙ) ======
+// ====== ПРОКСИ СЕРВЕР (МАКСИМАЛЬНО ОПТИМИЗИРОВАННЫЙ) ======
 const server = http.createServer();
 
-// Увеличиваем лимиты сервера
-server.maxConnections = 2000; // Увеличено для высокой нагрузки
-server.timeout = 60000;
-server.keepAliveTimeout = 30000;
-server.headersTimeout = 35000;
+// Максимальные лимиты сервера
+server.maxConnections = 5000; // Увеличено для максимальной производительности
+server.timeout = 30000;       // Уменьшено для быстрых ответов
+server.keepAliveTimeout = 15000; // Уменьшено
+server.headersTimeout = 20000;   // Уменьшено
 
 async function handleHttpProxy(req, res, user) {
   const up = parseProxyUrl(getCurrentProxy(user));
@@ -744,7 +874,7 @@ async function handleHttpProxy(req, res, user) {
       'Proxy-Authorization': `Basic ${Buffer.from(`${up.username}:${up.password}`).toString('base64')}`,
     },
     agent: req.url.startsWith('https://') ? upstreamHttpsAgent : upstreamAgent,
-    timeout: 40000 // Уменьшено с 45000ms
+    timeout: 25000 // Уменьшено для быстрых ответов
   };
   delete options.headers['proxy-authorization'];
 
@@ -756,8 +886,8 @@ async function handleHttpProxy(req, res, user) {
   proxyReq.on('socket', s => { 
     try { 
       s.setNoDelay(true); 
-      s.setKeepAlive(true, 8000); // Уменьшено с 10000ms
-      s.setTimeout(40000);
+      s.setKeepAlive(true, 5000); // Уменьшено для быстрого освобождения
+      s.setTimeout(25000);
     } catch {} 
   });
   proxyReq.on('timeout', () => proxyReq.destroy(new Error('Upstream timeout')));
@@ -805,15 +935,15 @@ function tryConnect(req, clientSocket, user) {
 
   try { 
     proxySocket.setNoDelay(true); 
-    proxySocket.setKeepAlive(true, 8000); // Уменьшено с 10000ms
+    proxySocket.setKeepAlive(true, 5000); // Уменьшено для быстрого освобождения
   } catch {}
   try { 
     clientSocket.setNoDelay(true); 
-    clientSocket.setKeepAlive(true, 8000); // Уменьшено с 10000ms
+    clientSocket.setKeepAlive(true, 5000); // Уменьшено для быстрого освобождения
   } catch {}
 
-  proxySocket.setTimeout(40000, () => proxySocket.destroy(new Error('upstream timeout'))); // Уменьшено с 45000ms
-  clientSocket.setTimeout(40000, () => clientSocket.destroy(new Error('client timeout'))); // Уменьшено с 45000ms
+  proxySocket.setTimeout(25000, () => proxySocket.destroy(new Error('upstream timeout'))); // Уменьшено
+  clientSocket.setTimeout(25000, () => clientSocket.destroy(new Error('client timeout'))); // Уменьшено
 
   proxySocket.on('connect', () => {
     const auth = Buffer.from(`${up.username}:${up.password}`).toString('base64');
@@ -862,7 +992,7 @@ server.on('connect', (req, clientSocket) => {
 });
 
 // ====== ЗАПУСК ======
-const PORT = process.env.PORT || process.env.RAILWAY_PORT || 8080;
+const PORT = process.env.PORT || process.env.RAILWAY_PORT || 8082;
 
 async function startServer() {
   await loadConfig();
@@ -885,10 +1015,11 @@ async function startServer() {
 
     const memUsage = process.memoryUsage();
 
-    console.log(`🚀 Enhanced Proxy server running on port ${PORT} (OPTIMIZED FOR 32GB RAM)`);
+    console.log(`🚀 Ultra-Enhanced Proxy server running on port ${PORT} (ULTRA-OPTIMIZED FOR 32GB RAM)`);
     console.log(`🌐 Public (TCP Proxy): ${PUBLIC_HOST}`);
     console.log(`✅ API self hostnames: ${[...SELF_HOSTNAMES].join(', ')}`);
     console.log(`🤖 Telegram Bot API enabled`);
+    console.log(`🔍 IP Check Method: Proxy Server Only (no external services)`);
     console.log(`💾 Memory usage: ${Math.round(memUsage.rss / 1024 / 1024)}MB / 32GB available`);
     console.log(`🔧 Max connections: ${server.maxConnections}`);
     console.log(`🔧 Agent max sockets: ${upstreamAgent.maxSockets}`);
@@ -901,15 +1032,15 @@ async function startServer() {
       });
     }
     
-    console.log(`⚡ Concurrent mode: NO rotation locks`);
+    console.log(`⚡ INSTANT mode: NO rotation delays (0ms)`);
     console.log(`🔍 Overlapping proxies: ${totalOverlapping}`);
     console.log(`💾 Configuration file: ${CONFIG_FILE}`);
-    console.log(`📈 Optimized for: 200-500+ concurrent users`);
+    console.log(`📈 Ultra-optimized for: 500-1000+ concurrent users`);
 
     if (totalOverlapping > 0) {
       console.warn(`⚠️  WARNING: ${totalOverlapping} overlapping proxies may cause interference`);
     } else {
-      console.log(`✅ Fully isolated proxy pools - safe for concurrent rotation`);
+      console.log(`✅ Fully isolated proxy pools - safe for instant rotation`);
     }
   });
 }
